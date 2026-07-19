@@ -21,10 +21,10 @@ app.use('/api/labels', labelsRoutes);
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`SwarKatha backend running on port ${PORT}`);
-  // The 8s MediaFire storage/bandwidth poll (lib/liveAccountsMonitor.js)
+  // The 8s Drime storage-usage poll (lib/liveAccountsMonitor.js)
   // is intentionally NOT started here. It starts itself the moment the
   // first admin app opens the storage screen and connects to
   // GET /api/storage/accounts/live, and stops itself once the last
   // admin app closes/disconnects — see acquire()/release() there and
-  // in routes/storage.js. No admin app open = no MediaFire traffic.
+  // in routes/storage.js. No admin app open = no Drime traffic.
 });

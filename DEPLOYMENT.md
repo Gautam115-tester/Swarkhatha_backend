@@ -1,6 +1,6 @@
 # SwarKatha — Deployment Guide (Backend)
 
-This covers getting the Phase-1 backend live: Supabase project, MediaFire storage
+This covers getting the Phase-1 backend live: Supabase project, Drime storage
 accounts, and the Node backend deployed to Render. Do these in order — later steps
 need values from earlier ones.
 
@@ -11,8 +11,9 @@ need values from earlier ones.
 1. Go to supabase.com → New Project. Pick a region close to your users, set a strong DB password.
 2. Once created, open **SQL Editor** → New query → paste the contents of `supabase/schema.sql` → Run.
    Then run `supabase/migration_labels_albums.sql`. If you're upgrading a project that
-   already had Backblaze storage accounts connected, also run
-   `supabase/migration_mediafire_only.sql` last.
+   already had MediaFire storage accounts connected, also run
+   `supabase/migration_mediafire_only.sql` and then `supabase/migration_drime_only.sql`
+   last, in that order.
 3. Go to **Project Settings → API**. Copy:
    - `Project URL` → this is `SUPABASE_URL`
    - `service_role` key (NOT `anon`) → this is `SUPABASE_SERVICE_ROLE_KEY`
@@ -36,16 +37,14 @@ need values from earlier ones.
 
 ## 2. Set up your storage accounts
 
-You don't need to pre-register anything with Render/OAuth here — MediaFire uses direct
-credentials that get sent once to `POST /api/storage/accounts` after the backend is
-deployed (step 4 below). Gather the values now:
+You don't need to pre-register anything with Render/OAuth here — Drime uses a
+per-account personal access token that gets sent once to `POST /api/storage/accounts`
+after the backend is deployed (step 4 below). Gather the values now:
 
-1. Sign up at mediafire.com. Streaming works on **free accounts too** — direct,
-   playable links draw from a shared 50 GB/day bandwidth pool per account. A **paid**
-   plan keeps streaming working once that daily pool is used up, and adds more
-   storage; free accounts still work fine for smaller catalogs/lower traffic.
-2. Go to mediafire.com/developers → register an application → copy the **Application
-   ID** and **API Key**.
+1. Sign up at [app.drime.cloud](https://app.drime.cloud). The free plan includes
+   20GB of storage, and the API is free to use on every plan.
+2. Go to **Account Settings → Developers → Create a token**, name it, and copy the
+   token. Repeat this once per Drime account you want to pool for storage.
 
 ---
 
@@ -89,12 +88,10 @@ You should get back a JWT. Use it to connect your first storage account:
 curl -X POST https://<your-service-name>.onrender.com/api/storage/accounts \
   -H "Authorization: Bearer <the JWT>" -H "Content-Type: application/json" \
   -d '{
-    "email": "you@example.com",
-    "password": "...",
-    "appId": "<application id, from mediafire.com/developers>",
-    "apiKey": "<api key, optional but recommended>",
+    "accessToken": "<personal access token from app.drime.cloud/account-settings>",
+    "workspaceId": 0,
     "purpose": "both",
-    "label": "MediaFire - main"
+    "label": "Drime - main"
   }'
 ```
 Then confirm it's live:
@@ -108,9 +105,9 @@ should list that account with its live free space.
 
 ## 5. Repeat for additional accounts
 
-Just call `POST /api/storage/accounts` again with different MediaFire credentials.
-Each becomes its own row in `storage_accounts` — no code changes needed to add more
-storage capacity.
+Just call `POST /api/storage/accounts` again with a different Drime account's access
+token. Each becomes its own row in `storage_accounts` — no code changes needed to add
+more storage capacity.
 
 ---
 
@@ -119,9 +116,10 @@ storage capacity.
 | Symptom | Likely cause |
 |---|---|
 | `401 Invalid or expired token` on every request | `JWT_SECRET` differs between when the token was issued and now (e.g. you changed it after deploy) — log in again |
-| `stream-url` / `download-url` return `503` | This account's shared 50GB/day free direct-download bandwidth pool is likely exhausted for today — wait for the daily reset, or upgrade to a paid MediaFire account to keep working past that cap |
-| Free space always shows stale numbers | `/api/storage/accounts` refreshes live from MediaFire on every call, so this shouldn't happen — check the account's credentials are still valid |
+| `stream-url` / `download-url` links stop working after ~15 minutes | Expected — they're short-lived signed URLs (`STREAM_TOKEN_TTL_SECONDS`); the app should re-request `stream-url`/`download-url` if playback needs to resume after a long pause |
+| Free space always shows stale numbers | `/api/storage/accounts` refreshes live from Drime on every call, so this shouldn't happen — check the account's access token hasn't been revoked from the Drime dashboard |
 | Upload returns 507 | No connected account currently has enough free space for that file — add another account or free up space in an existing one |
-| MediaFire account setup fails immediately | Double-check the `email`/`password` are correct and, if you supplied `apiKey`, that it matches the `appId` from the same MediaFire developer app |
+| Drime account setup fails immediately | Double-check the `accessToken` was copied in full and hasn't been revoked — tokens are managed under Account Settings → Developers on app.drime.cloud |
+| `POST /api/media` returns "Missing required fields" | Make sure both `storageFileId` and `storageHash` from the `/api/storage/upload` response are passed through — Drime needs both (one to delete, one to stream) |
 
 Next: the Flutter app itself, wired to these endpoints.

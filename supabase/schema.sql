@@ -13,18 +13,23 @@ create table app_users (
   created_at timestamptz default now()
 );
 
--- ============ STORAGE ACCOUNTS (admin-added MediaFire pools) ============
+-- ============ STORAGE ACCOUNTS (admin-added Drime pools) ============
 -- credentials_enc holds a JSON blob encrypted at rest by the app layer
 -- (see lib/crypto.js) — never store plaintext creds.
---   mediafire -> { email, password, appId, apiKey, folderKey }
+--   drime -> { accessToken, workspaceId, folderId }
+--   (accessToken is a Drime personal access token created from that
+--   account's dashboard: Account Settings -> Developers -> Create a
+--   token — there is no email/password login step for Drime.)
 create table storage_accounts (
   id uuid primary key default uuid_generate_v4(),
-  provider text not null default 'mediafire' check (provider in ('mediafire')),
-  label text not null,                     -- e.g. "MediaFire - main"
+  provider text not null default 'drime' check (provider in ('drime')),
+  label text not null,                     -- e.g. "Drime - main"
   purpose text not null default 'both' check (purpose in ('music','audio_story','both')),
   credentials_enc text not null,
   is_active boolean default true,
   last_known_free_bytes bigint,
+  last_known_used_bytes bigint,
+  last_known_total_bytes bigint,
   last_checked_at timestamptz,
   created_at timestamptz default now()
 );
@@ -39,10 +44,11 @@ create table media_items (
   cover_image_url text,
   duration_seconds int,
   file_size_bytes bigint,
-  storage_provider text not null default 'mediafire' check (storage_provider in ('mediafire')),
+  storage_provider text not null default 'drime' check (storage_provider in ('drime')),
   storage_account_id uuid references storage_accounts(id),
-  storage_file_id text not null,           -- MediaFire quickkey
-  storage_path text not null,              -- filename within that account
+  storage_file_id text not null,           -- Drime file entry id (used to delete)
+  storage_hash text not null,              -- Drime file hash (used to stream/download bytes)
+  storage_path text not null,              -- display filename within that account
   category text,                            -- Classical/Bollywood/Folk... or Epic Legends/Historical Dramas...
   chapter_number int,                       -- only for audio_story, ordering within a series
   uploaded_by uuid references app_users(id),

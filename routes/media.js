@@ -1,6 +1,8 @@
 const express = require('express');
 const supabase = require('../lib/supabaseClient');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { decrypt } = require('../lib/crypto');
+const drime = require('../lib/drime');
 
 const router = express.Router();
 
@@ -18,7 +20,7 @@ router.get('/', requireAuth, async (req, res) => {
 /* ------------------------------------------------------------------
  * Filename/title sanitizer for the story-episode composition rule.
  * Strips underscores (the field separator) and characters that are
- * unsafe as a storage filename (on MediaFire), and
+ * unsafe as a storage filename (on Drime), and
  * collapses whitespace. Applied to every segment independently so a
  * story title containing "_" can't be mistaken for an extra field
  * when the parts are later split.
@@ -78,15 +80,15 @@ async function findOrCreateAlbum({ name, artist, coverImageUrl }) {
 router.post('/', requireAuth, requireAdmin, async (req, res) => {
   const {
     type, title, artistOrNarrator, albumOrSeries, coverImageUrl, durationSeconds,
-    fileSizeBytes, storageProvider, storageAccountId, storageFileId, storagePath, contentLabelId,
+    fileSizeBytes, storageProvider, storageAccountId, storageFileId, storageHash, storagePath, contentLabelId,
     chapterNumber, storyTitle, episodeTitle
   } = req.body;
 
-  if (!type || !storageProvider || !storageAccountId || !storageFileId || !storagePath) {
+  if (!type || !storageProvider || !storageAccountId || !storageFileId || !storageHash || !storagePath) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
-  if (storageProvider !== 'mediafire') {
-    return res.status(400).json({ error: "storageProvider must be 'mediafire'" });
+  if (storageProvider !== 'drime') {
+    return res.status(400).json({ error: "storageProvider must be 'drime'" });
   }
   if (!['music', 'audio_story'].includes(type)) {
     return res.status(400).json({ error: 'type must be music or audio_story' });
@@ -116,6 +118,7 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
     storage_provider: storageProvider,
     storage_account_id: storageAccountId,
     storage_file_id: storageFileId,
+    storage_hash: storageHash,
     storage_path: storagePath,
     content_label_id: contentLabelId || null,
     category: categoryText,
@@ -181,6 +184,24 @@ router.get('/stories', requireAuth, async (req, res) => {
 });
 
 router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { data: item } = await supabase.from('media_items').select('*').eq('id', req.params.id).single();
+
+  // Best-effort: also remove the underlying file from Drime so deleting
+  // a media item doesn't leave storage space silently occupied forever.
+  // A failure here (account gone, token revoked, file already missing)
+  // should never block removing the catalog row itself.
+  if (item?.storage_account_id && item?.storage_file_id) {
+    try {
+      const { data: account } = await supabase.from('storage_accounts').select('*').eq('id', item.storage_account_id).single();
+      if (account) {
+        const creds = JSON.parse(decrypt(account.credentials_enc));
+        await drime.deleteFile({ accessToken: creds.accessToken, fileEntryId: item.storage_file_id });
+      }
+    } catch (e) {
+      console.error('[media delete] failed to delete underlying Drime file (continuing):', e.response?.data?.message || e.message);
+    }
+  }
+
   const { error } = await supabase.from('media_items').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });

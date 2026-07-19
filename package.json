@@ -1,7 +1,7 @@
 {
   "name": "swarkatha-backend",
   "version": "1.0.0",
-  "description": "Server-side OAuth + multi-account MediaFire storage router for SwarKatha",
+  "description": "Server-side token-based multi-account Drime storage router for SwarKatha",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -15,7 +15,6 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "form-data": "^4.0.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.1"
   },
@@ -23,3 +22,4 @@
     "nodemon": "^3.1.4"
   }
 }
+
