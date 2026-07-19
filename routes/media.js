@@ -72,6 +72,39 @@ async function findOrCreateAlbum({ name, artist, coverImageUrl }) {
   return created;
 }
 
+// Find-or-create a story_series row for an audio_story upload — the
+// audio-story equivalent of findOrCreateAlbum() above. Matches on title
+// alone (a story keeps one series row across episodes even if a later
+// episode credits a different narrator or a new cover gets set), and
+// episode_count is incremented server-side so it never drifts, exactly
+// like albums.track_count. Requires migration_story_series.sql to have
+// been run — if the story_series table doesn't exist yet, this throws
+// and the caller surfaces that as a 500 with the real Postgres error.
+async function findOrCreateStorySeries({ title, narrator, coverImageUrl }) {
+  const seriesTitle = sanitizeSegment(title);
+
+  const { data: existing, error: findErr } = await supabase
+    .from('story_series').select('*').eq('title', seriesTitle).maybeSingle();
+  if (findErr) throw new Error(findErr.message);
+
+  if (existing) {
+    const update = { episode_count: existing.episode_count + 1 };
+    if (!existing.cover_image_url && coverImageUrl) update.cover_image_url = coverImageUrl;
+    if (!existing.narrator && narrator) update.narrator = narrator;
+    const { data: updated, error: updErr } = await supabase
+      .from('story_series').update(update).eq('id', existing.id).select().single();
+    if (updErr) throw new Error(updErr.message);
+    return updated;
+  }
+
+  const { data: created, error: createErr } = await supabase
+    .from('story_series')
+    .insert({ title: seriesTitle, narrator: narrator || null, cover_image_url: coverImageUrl || null, episode_count: 1 })
+    .select().single();
+  if (createErr) throw new Error(createErr.message);
+  return created;
+}
+
 // Admin: register metadata for a file already uploaded via /api/storage/upload.
 // type = 'music'        -> album is auto-created/matched from albumOrSeries + artistOrNarrator.
 // type = 'audio_story'  -> title is composed as StoryTitle_EpNumber_EpTitle server-side,
@@ -143,10 +176,18 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
     if (chapterNumber === undefined || chapterNumber === null || chapterNumber === '') {
       return res.status(400).json({ error: 'chapterNumber (episode number) is required for audio_story' });
     }
+    try {
+      const series = await findOrCreateStorySeries({
+        title: storyTitle, narrator: artistOrNarrator, coverImageUrl
+      });
+      insertRow.story_series_id = series.id;
+    } catch (e) {
+      return res.status(500).json({ error: 'Story series lookup/create failed: ' + e.message });
+    }
     insertRow.title = composeEpisodeTitle(storyTitle, chapterNumber, episodeTitle);
     insertRow.story_title = sanitizeSegment(storyTitle);
     insertRow.episode_title = episodeTitle ? sanitizeSegment(episodeTitle) : null;
-    insertRow.album_or_series = sanitizeSegment(storyTitle); // series grouping = story title
+    insertRow.album_or_series = sanitizeSegment(storyTitle); // series grouping = story title (legacy listener app)
     insertRow.chapter_number = Number(chapterNumber);
   }
 
@@ -165,21 +206,23 @@ router.get('/albums', requireAuth, async (req, res) => {
 
 // List distinct story series (audio_story) with episode counts — lets the
 // admin app show "add another episode to an existing story" instead of
-// always starting a brand-new series.
+// always starting a brand-new series. Now backed by the story_series
+// table (see migration_story_series.sql) instead of scanning every
+// audio_story row and grouping by story_title text on every request.
 router.get('/stories', requireAuth, async (req, res) => {
   const { data, error } = await supabase
-    .from('media_items')
-    .select('story_title')
-    .eq('type', 'audio_story')
-    .not('story_title', 'is', null);
+    .from('story_series')
+    .select('*')
+    .order('title');
   if (error) return res.status(500).json({ error: error.message });
 
-  const counts = {};
-  for (const row of data) counts[row.story_title] = (counts[row.story_title] || 0) + 1;
-  const stories = Object.entries(counts)
-    .map(([storyTitle, episodeCount]) => ({ storyTitle, episodeCount }))
-    .sort((a, b) => a.storyTitle.localeCompare(b.storyTitle));
-
+  const stories = data.map((s) => ({
+    id: s.id,
+    storyTitle: s.title,
+    narrator: s.narrator,
+    coverImageUrl: s.cover_image_url,
+    episodeCount: s.episode_count
+  }));
   res.json({ stories });
 });
 
