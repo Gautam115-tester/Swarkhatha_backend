@@ -77,10 +77,16 @@ router.get('/accounts', requireAuth, requireAdmin, async (req, res) => {
  * 2b) LIVE STREAM (admin only) — Server-Sent Events. Pushes the
  *     current cached snapshot once a second so a dashboard can just
  *     render whatever arrives, no client-side polling/timers needed.
- *     The underlying MediaFire calls only happen on the monitor's own
- *     interval (see liveAccountsMonitor.js); this just re-broadcasts
- *     the latest cached numbers every second, plus immediately
- *     whenever a real refresh completes.
+ *
+ *     This connection is also what turns the monitor's 8s MediaFire
+ *     poll on and off: connecting calls liveMonitor.acquire(), which
+ *     starts the poll if this is the first admin connected; the
+ *     req.on('close') handler (fires when the admin app is closed,
+ *     backgrounded past its socket timeout, or loses connectivity)
+ *     calls liveMonitor.release(), which stops the poll once the last
+ *     admin has disconnected. So: admin app open -> checks MediaFire
+ *     every 8s; admin app closed -> stops checking. Multiple admins
+ *     open at once still share one 8s poll, not one each.
  * ------------------------------------------------------------------ */
 router.get('/accounts/live', requireAuth, requireAdmin, (req, res) => {
   res.writeHead(200, {
@@ -91,6 +97,7 @@ router.get('/accounts/live', requireAuth, requireAdmin, (req, res) => {
   });
 
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  liveMonitor.acquire();
   send(liveMonitor.getSnapshot());
 
   const heartbeat = setInterval(() => send(liveMonitor.getSnapshot()), 1000);
@@ -100,6 +107,7 @@ router.get('/accounts/live', requireAuth, requireAdmin, (req, res) => {
   req.on('close', () => {
     clearInterval(heartbeat);
     liveMonitor.off('update', onUpdate);
+    liveMonitor.release();
   });
 });
 

@@ -6,7 +6,6 @@ const authRoutes = require('./routes/auth');
 const storageRoutes = require('./routes/storage');
 const mediaRoutes = require('./routes/media');
 const labelsRoutes = require('./routes/labels');
-const liveAccountsMonitor = require('./lib/liveAccountsMonitor');
 
 const app = express();
 app.use(cors());
@@ -22,5 +21,10 @@ app.use('/api/labels', labelsRoutes);
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`SwarKatha backend running on port ${PORT}`);
-  liveAccountsMonitor.start();
+  // The 8s MediaFire storage/bandwidth poll (lib/liveAccountsMonitor.js)
+  // is intentionally NOT started here. It starts itself the moment the
+  // first admin app opens the storage screen and connects to
+  // GET /api/storage/accounts/live, and stops itself once the last
+  // admin app closes/disconnects — see acquire()/release() there and
+  // in routes/storage.js. No admin app open = no MediaFire traffic.
 });
