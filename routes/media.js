@@ -89,7 +89,11 @@ async function findOrCreateStorySeries({ title, narrator, coverImageUrl }) {
 
   if (existing) {
     const update = { episode_count: existing.episode_count + 1 };
-    if (!existing.cover_image_url && coverImageUrl) update.cover_image_url = coverImageUrl;
+    // Unlike albums (first cover wins, see findOrCreateAlbum), a
+    // story's cover can be replaced any time the admin manually
+    // uploads a fresh one — the caller in POST /api/media then
+    // propagates it to every existing episode of the series too.
+    if (coverImageUrl) update.cover_image_url = coverImageUrl;
     if (!existing.narrator && narrator) update.narrator = narrator;
     const { data: updated, error: updErr } = await supabase
       .from('story_series').update(update).eq('id', existing.id).select().single();
@@ -195,17 +199,17 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
         title: storyTitle, narrator: artistOrNarrator, coverImageUrl
       });
       insertRow.story_series_id = series.id;
-      // Same sharing rule as albums above: the story's cover image
-      // (set on this upload or an earlier episode) applies to every
-      // episode, and earlier episodes uploaded before a cover existed
-      // get backfilled too.
-      insertRow.cover_image_url = series.cover_image_url || coverImageUrl || null;
-      if (series.cover_image_url) {
-        const { error: backfillErr } = await supabase.from('media_items')
-          .update({ cover_image_url: series.cover_image_url })
-          .eq('story_series_id', series.id)
-          .is('cover_image_url', null);
-        if (backfillErr) console.error('[media create] story cover backfill failed (continuing):', backfillErr.message);
+      insertRow.cover_image_url = series.cover_image_url || null;
+      // If the admin uploaded a fresh cover on this request, it's now
+      // the series' cover (findOrCreateStorySeries already saved it on
+      // the series row above) — push it onto every episode already in
+      // this series too, so a manual re-cover takes effect everywhere
+      // immediately, not just for episodes uploaded from now on.
+      if (coverImageUrl) {
+        const { error: propErr } = await supabase.from('media_items')
+          .update({ cover_image_url: coverImageUrl })
+          .eq('story_series_id', series.id);
+        if (propErr) console.error('[media create] story cover propagation failed (continuing):', propErr.message);
       }
     } catch (e) {
       return res.status(500).json({ error: 'Story series lookup/create failed: ' + e.message });
