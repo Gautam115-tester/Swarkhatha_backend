@@ -28,10 +28,31 @@ router.post('/accounts', requireAuth, requireAdmin, async (req, res) => {
     return res.status(400).json({ error: 'email and password are required' });
   }
 
+  // Each MediaFire call is wrapped separately (rather than one shared
+  // try/catch around the whole flow) so a failure names exactly which
+  // step it came from — get_session_token.php and get_info.php are
+  // different endpoints and can fail for different reasons, and a
+  // generic "account setup failed" message that merges both makes it
+  // impossible to tell which one actually broke from the error alone.
+  let session;
   try {
-    const session = await mediafire.getSessionToken({ email, password, appId, apiKey });
-    const info = await mediafire.getAccountInfo({ sessionToken: session.sessionToken });
+    session = await mediafire.getSessionToken({ email, password, appId, apiKey });
+  } catch (e) {
+    const msg = e.response?.data?.response?.message || e.response?.data?.message || e.message;
+    console.error('[storage/accounts] getSessionToken failed:', msg, '| request had appId:', !!appId, '| apiKey:', !!apiKey);
+    return res.status(500).json({ error: `MediaFire login failed (user/get_session_token.php): ${msg}` });
+  }
 
+  let info;
+  try {
+    info = await mediafire.getAccountInfo({ sessionToken: session.sessionToken });
+  } catch (e) {
+    const msg = e.response?.data?.response?.message || e.response?.data?.message || e.message;
+    console.error('[storage/accounts] getAccountInfo failed:', msg);
+    return res.status(500).json({ error: `MediaFire account info fetch failed (user/get_info.php): ${msg}` });
+  }
+
+  try {
     const creds = { email, password, appId, apiKey, folderKey };
     const { data: row, error } = await supabase.from('storage_accounts').insert({
       provider: 'mediafire',
@@ -41,14 +62,15 @@ router.post('/accounts', requireAuth, requireAdmin, async (req, res) => {
       last_known_free_bytes: info.limitBytes - info.usedBytes,
       last_checked_at: new Date().toISOString()
     }).select().single();
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) return res.status(500).json({ error: `Saving the account failed (database): ${error.message}` });
     liveMonitor.refreshAll(); // don't await — let the response return immediately, cache/SSE catch up within a second
     return res.json({
       account: { id: row.id, label: row.label, provider: 'mediafire', purpose: row.purpose },
       note: 'Streaming works on free MediaFire accounts too, sharing a 50GB/day direct-download bandwidth pool; a paid MediaFire account keeps streaming working past that daily cap and also gets more storage.'
     });
   } catch (e) {
-    return res.status(500).json({ error: 'MediaFire account setup failed: ' + (e.response?.data?.message || e.response?.data?.response?.message || e.message) });
+    console.error('[storage/accounts] unexpected error after MediaFire login succeeded:', e.message);
+    return res.status(500).json({ error: `Saving the account failed: ${e.message}` });
   }
 });
 
