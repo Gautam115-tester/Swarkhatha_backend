@@ -308,6 +308,22 @@ async function proxyMedia(req, res, { forceDownload }) {
     for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
       if (upstream.headers[header]) res.setHeader(header, upstream.headers[header]);
     }
+    // Force Accept-Ranges: bytes even if Drime omitted it. Some audio
+    // players (esp. on Android/ExoPlayer and iOS AVPlayer) only attempt
+    // byte-range requests — and therefore only start playing after the
+    // first small chunk instead of waiting for the whole file — when
+    // this header is present on the *initial* response. Missing it is a
+    // common root cause of "streaming" actually behaving like a full
+    // download before playback starts.
+    if (!res.getHeader('accept-ranges')) res.setHeader('Accept-Ranges', 'bytes');
+    if (!forceDownload) {
+      // Explicitly mark this as inline/streamable (never a download
+      // prompt) and disable caching of what may be a short-lived signed
+      // proxy response, so the player always re-requests through a
+      // fresh token instead of trying to reuse a stale cached copy.
+      res.setHeader('Content-Disposition', 'inline');
+      res.setHeader('Cache-Control', 'no-store');
+    }
     if (forceDownload) {
       const fileName = (item.storage_path || item.title || 'download').replace(/"/g, '');
       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);

@@ -7,11 +7,24 @@ const drime = require('../lib/drime');
 const router = express.Router();
 
 // Public catalog (any logged-in listener)
+//
+// albumId / storySeriesId are the two filters the player needs to build
+// an ordered "what plays next" queue (this is what issue 1 — the player
+// not auto-advancing — needs from the backend side). When either is
+// present the app is asking for one specific album/series' contents, so
+// ordering switches from created_at desc (newest-first, right for
+// browse/list screens) to actual playback order: album tracks by upload
+// order (media_items has no track-number column, so created_at asc is
+// the best available proxy), story episodes by chapter_number asc (the
+// real, authoritative episode order).
 router.get('/', requireAuth, async (req, res) => {
-  const { type, category } = req.query;
-  let q = supabase.from('media_items').select('*').order('created_at', { ascending: false });
+  const { type, category, albumId, storySeriesId } = req.query;
+  let q = supabase.from('media_items').select('*');
   if (type) q = q.eq('type', type);
   if (category) q = q.eq('category', category);
+  if (albumId) q = q.eq('album_id', albumId).order('created_at', { ascending: true });
+  else if (storySeriesId) q = q.eq('story_series_id', storySeriesId).order('chapter_number', { ascending: true });
+  else q = q.order('created_at', { ascending: false });
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json({ items: data });
@@ -254,6 +267,47 @@ router.get('/stories', requireAuth, async (req, res) => {
     episodeCount: s.episode_count
   }));
   res.json({ stories });
+});
+
+// List episodes of one story series, ordered by episode/chapter number —
+// this is what the listener app should call when the user taps an audio
+// series, so it can render "Episode N — Episode Title" per row instead
+// of just the composed StoryTitle_N_Title `title` field. Episode title
+// is optional (per the upload spec), so `episodeTitle` may come back null.
+router.get('/stories/:id/episodes', requireAuth, async (req, res) => {
+  const { data: series, error: seriesErr } = await supabase
+    .from('story_series').select('*').eq('id', req.params.id).maybeSingle();
+  if (seriesErr) return res.status(500).json({ error: seriesErr.message });
+  if (!series) return res.status(404).json({ error: 'Story series not found' });
+
+  const { data, error } = await supabase
+    .from('media_items')
+    .select('*')
+    .eq('story_series_id', req.params.id)
+    .order('chapter_number', { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+
+  const episodes = data.map((m) => ({
+    id: m.id,
+    episodeNumber: m.chapter_number,
+    episodeTitle: m.episode_title || null,
+    title: m.title, // composed "StoryTitle_N_Title" — kept for the legacy client
+    coverImageUrl: m.cover_image_url,
+    durationSeconds: m.duration_seconds,
+    fileSizeBytes: m.file_size_bytes,
+    category: m.category
+  }));
+
+  res.json({
+    series: {
+      id: series.id,
+      storyTitle: series.title,
+      narrator: series.narrator,
+      coverImageUrl: series.cover_image_url,
+      episodeCount: series.episode_count
+    },
+    episodes
+  });
 });
 
 router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
