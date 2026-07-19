@@ -167,6 +167,20 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
       insertRow.title = title;
       insertRow.album_or_series = album.name;
       insertRow.album_id = album.id;
+      // Album art is shared across every track in the album: once the
+      // album has a cover_image_url (set by this upload or an earlier
+      // one), every track uses that same image rather than whatever
+      // this particular upload individually sent. Also backfill any
+      // earlier tracks of this album that were inserted before a cover
+      // existed, so the whole album is consistent going forward.
+      insertRow.cover_image_url = album.cover_image_url || coverImageUrl || null;
+      if (album.cover_image_url) {
+        const { error: backfillErr } = await supabase.from('media_items')
+          .update({ cover_image_url: album.cover_image_url })
+          .eq('album_id', album.id)
+          .is('cover_image_url', null);
+        if (backfillErr) console.error('[media create] album cover backfill failed (continuing):', backfillErr.message);
+      }
     } catch (e) {
       return res.status(500).json({ error: 'Album lookup/create failed: ' + e.message });
     }
@@ -181,6 +195,18 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
         title: storyTitle, narrator: artistOrNarrator, coverImageUrl
       });
       insertRow.story_series_id = series.id;
+      // Same sharing rule as albums above: the story's cover image
+      // (set on this upload or an earlier episode) applies to every
+      // episode, and earlier episodes uploaded before a cover existed
+      // get backfilled too.
+      insertRow.cover_image_url = series.cover_image_url || coverImageUrl || null;
+      if (series.cover_image_url) {
+        const { error: backfillErr } = await supabase.from('media_items')
+          .update({ cover_image_url: series.cover_image_url })
+          .eq('story_series_id', series.id)
+          .is('cover_image_url', null);
+        if (backfillErr) console.error('[media create] story cover backfill failed (continuing):', backfillErr.message);
+      }
     } catch (e) {
       return res.status(500).json({ error: 'Story series lookup/create failed: ' + e.message });
     }

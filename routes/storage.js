@@ -5,9 +5,11 @@ const { encrypt, decrypt } = require('../lib/crypto');
 const { requireAuth, requireAdmin, signMediaToken, requireMediaAccess } = require('../middleware/auth');
 const drime = require('../lib/drime');
 const liveMonitor = require('../lib/liveAccountsMonitor');
+const imageStorage = require('../lib/imageStorage');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } }); // 1GB cap
+const uploadImage = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB cap for cover images
 
 const PURPOSES = ['music', 'audio_story', 'both'];
 const STREAM_TOKEN_TTL_SECONDS = Number(process.env.STREAM_TOKEN_TTL_SECONDS || 900); // 15 min
@@ -207,6 +209,34 @@ router.post('/upload', requireAuth, requireAdmin, upload.single('file'), async (
     });
   } catch (e) {
     res.status(500).json({ error: 'Upload failed: ' + (e.response?.data?.message || e.message) });
+  }
+});
+
+/* ------------------------------------------------------------------
+ * 3b) UPLOAD COVER IMAGE  (admin only)
+ *    Body: multipart field 'image' (jpg/png/webp/gif, 10MB cap) +
+ *    field 'kind' = 'album' | 'story' (just a storage-path prefix,
+ *    purely cosmetic in the Supabase dashboard).
+ *
+ *    Used for both flows:
+ *      - music: the admin app uploads the track's embedded cover art
+ *        (extracted client-side from ID3/MP4 tags) here to get a URL,
+ *        then sends that URL as coverImageUrl on POST /api/media.
+ *      - audio_story: the admin picks a cover image by hand (episode
+ *        files are almost always untagged raw recordings) only when
+ *        starting a *new* story; existing stories already have one.
+ *
+ *    Either way, all images end up in Supabase Storage — see
+ *    lib/imageStorage.js — never on Drime, which is audio-only.
+ * ------------------------------------------------------------------ */
+router.post('/upload-image', requireAuth, requireAdmin, uploadImage.single('image'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No image provided' });
+  const prefix = req.body.kind === 'story' ? 'story' : 'album';
+  try {
+    const url = await imageStorage.uploadImage({ buffer: req.file.buffer, mime: req.file.mimetype, prefix });
+    res.json({ url });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
