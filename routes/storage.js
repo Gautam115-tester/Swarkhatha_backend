@@ -4,6 +4,7 @@ const supabase = require('../lib/supabaseClient');
 const { encrypt, decrypt } = require('../lib/crypto');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const mediafire = require('../lib/mediafire');
+const liveMonitor = require('../lib/liveAccountsMonitor');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } }); // 1GB cap
@@ -41,6 +42,7 @@ router.post('/accounts', requireAuth, requireAdmin, async (req, res) => {
       last_checked_at: new Date().toISOString()
     }).select().single();
     if (error) return res.status(500).json({ error: error.message });
+    liveMonitor.refreshAll(); // don't await — let the response return immediately, cache/SSE catch up within a second
     return res.json({
       account: { id: row.id, label: row.label, provider: 'mediafire', purpose: row.purpose },
       note: 'Streaming works on free MediaFire accounts too, sharing a 50GB/day direct-download bandwidth pool; a paid MediaFire account keeps streaming working past that daily cap and also gets more storage.'
@@ -51,34 +53,54 @@ router.post('/accounts', requireAuth, requireAdmin, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
- * 2) LIST ACCOUNTS + LIVE FREE SPACE  (admin only)
+ * 2) LIST ACCOUNTS + LIVE FREE SPACE + BANDWIDTH  (admin only)
+ *    Serves the in-memory cache instantly (refreshed in the
+ *    background every STORAGE_REFRESH_INTERVAL_MS — see
+ *    lib/liveAccountsMonitor.js). Pass ?force=true to block for a
+ *    fresh MediaFire pull right now instead of the cached snapshot
+ *    (useful right after adding/editing an account).
  * ------------------------------------------------------------------ */
 router.get('/accounts', requireAuth, requireAdmin, async (req, res) => {
-  const { data: accounts, error } = await supabase.from('storage_accounts').select('*').eq('is_active', true);
-  if (error) return res.status(500).json({ error: error.message });
+  if (req.query.force === 'true') {
+    await liveMonitor.refreshAll();
+  }
+  const snapshot = liveMonitor.getSnapshot();
+  if (snapshot.length === 0) {
+    // Cache hasn't populated yet (e.g. right after server boot) — do
+    // one synchronous refresh so the admin doesn't see an empty list.
+    await liveMonitor.refreshAll();
+  }
+  res.json({ accounts: liveMonitor.getSnapshot(), refreshIntervalMs: Number(process.env.STORAGE_REFRESH_INTERVAL_MS || 8000) });
+});
 
-  const results = await Promise.all(accounts.map(async (acct) => {
-    try {
-      const creds = loadCreds(acct);
-      const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
-      const info = await mediafire.getAccountInfo({ sessionToken: session.sessionToken });
-      const freeBytes = info.limitBytes - info.usedBytes;
+/* ------------------------------------------------------------------
+ * 2b) LIVE STREAM (admin only) — Server-Sent Events. Pushes the
+ *     current cached snapshot once a second so a dashboard can just
+ *     render whatever arrives, no client-side polling/timers needed.
+ *     The underlying MediaFire calls only happen on the monitor's own
+ *     interval (see liveAccountsMonitor.js); this just re-broadcasts
+ *     the latest cached numbers every second, plus immediately
+ *     whenever a real refresh completes.
+ * ------------------------------------------------------------------ */
+router.get('/accounts/live', requireAuth, requireAdmin, (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
 
-      await supabase.from('storage_accounts').update({
-        last_known_free_bytes: freeBytes, last_checked_at: new Date().toISOString()
-      }).eq('id', acct.id);
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  send(liveMonitor.getSnapshot());
 
-      return {
-        id: acct.id, label: acct.label, provider: acct.provider, purpose: acct.purpose,
-        freeBytes, freeGB: (freeBytes / 1e9).toFixed(2),
-        usedBytes: info.usedBytes, totalBytes: info.limitBytes, status: 'ok'
-      };
-    } catch (e) {
-      return { id: acct.id, label: acct.label, provider: acct.provider, purpose: acct.purpose, status: 'error', error: e.message };
-    }
-  }));
+  const heartbeat = setInterval(() => send(liveMonitor.getSnapshot()), 1000);
+  const onUpdate = (snapshot) => send(snapshot);
+  liveMonitor.on('update', onUpdate);
 
-  res.json({ accounts: results.sort((a, b) => (b.freeBytes || Infinity) - (a.freeBytes || Infinity)) });
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    liveMonitor.off('update', onUpdate);
+  });
 });
 
 // Admin: rename/re-tag an account
@@ -165,25 +187,19 @@ router.get('/stream-url/:mediaItemId', requireAuth, async (req, res) => {
     const creds = loadCreds(account);
     const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
     const link = await mediafire.getStreamLink({ sessionToken: session.sessionToken, quickKey: item.storage_file_id });
-    return res.json({
-      url: link.url,
-      direct: link.direct,
-      freeBandwidthMB: link.freeBandwidthMB,
-      provider: 'mediafire',
-      note: link.direct
-        ? undefined
-        : 'MediaFire could not issue a direct streaming link right now (e.g. this account\'s free 50GB/day direct-download bandwidth may be exhausted for today) — this is a view-page link, not directly playable.'
-    });
+    return res.json({ url: link.url, freeBandwidthMB: link.freeBandwidthMB, provider: 'mediafire' });
   } catch (e) {
-    res.status(500).json({ error: 'Failed to resolve stream link: ' + (e.response?.data?.message || e.message) });
+    res.status(503).json({ error: 'Failed to resolve stream link: ' + (e.response?.data?.message || e.message) });
   }
 });
 
 /* ------------------------------------------------------------------
  * 5) DOWNLOAD LINK  (any logged-in listener) — for saving music/audio
- *    stories offline, as opposed to stream-url which is for inline
- *    playback. Works on free MediaFire accounts too, unlike the
- *    direct_download link stream-url prefers.
+ *    stories offline. Uses the same direct_download link type as
+ *    stream-url (MediaFire has no separate raw-bytes link for
+ *    "download" vs "stream" — normal_download is a web page, not
+ *    fetchable file bytes, so it can't back an automated download).
+ *    Both draw from the same shared 50GB/day free bandwidth pool.
  * ------------------------------------------------------------------ */
 router.get('/download-url/:mediaItemId', requireAuth, async (req, res) => {
   const { data: item } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
@@ -196,9 +212,9 @@ router.get('/download-url/:mediaItemId', requireAuth, async (req, res) => {
     const creds = loadCreds(account);
     const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
     const link = await mediafire.getDownloadLink({ sessionToken: session.sessionToken, quickKey: item.storage_file_id });
-    return res.json({ url: link.url, fileName: link.fileName || item.storage_path, provider: 'mediafire' });
+    return res.json({ url: link.url, fileName: item.storage_path, freeBandwidthMB: link.freeBandwidthMB, provider: 'mediafire' });
   } catch (e) {
-    res.status(500).json({ error: 'Failed to resolve download link: ' + (e.response?.data?.message || e.message) });
+    res.status(503).json({ error: 'Failed to resolve download link: ' + (e.response?.data?.message || e.message) });
   }
 });
 

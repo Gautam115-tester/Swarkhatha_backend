@@ -119,7 +119,7 @@ storage capacity.
 | Symptom | Likely cause |
 |---|---|
 | `401 Invalid or expired token` on every request | `JWT_SECRET` differs between when the token was issued and now (e.g. you changed it after deploy) — log in again |
-| MediaFire `stream-url` returns a view-page link instead of a direct one | This account's shared 50GB/day free direct-download bandwidth pool is likely exhausted for today — wait for the daily reset, or upgrade to a paid MediaFire account to keep streaming past that cap |
+| `stream-url` / `download-url` return `503` | This account's shared 50GB/day free direct-download bandwidth pool is likely exhausted for today — wait for the daily reset, or upgrade to a paid MediaFire account to keep working past that cap |
 | Free space always shows stale numbers | `/api/storage/accounts` refreshes live from MediaFire on every call, so this shouldn't happen — check the account's credentials are still valid |
 | Upload returns 507 | No connected account currently has enough free space for that file — add another account or free up space in an existing one |
 | MediaFire account setup fails immediately | Double-check the `email`/`password` are correct and, if you supplied `apiKey`, that it matches the `appId` from the same MediaFire developer app |
