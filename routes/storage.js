@@ -3,13 +3,11 @@ const multer = require('multer');
 const supabase = require('../lib/supabaseClient');
 const { encrypt, decrypt } = require('../lib/crypto');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
-const b2 = require('../lib/backblaze');
 const mediafire = require('../lib/mediafire');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } }); // 1GB cap
 
-const PROVIDERS = ['backblaze', 'mediafire'];
 const PURPOSES = ['music', 'audio_story', 'both'];
 
 function loadCreds(account) {
@@ -18,65 +16,37 @@ function loadCreds(account) {
 
 /* ------------------------------------------------------------------
  * 1) ADD A STORAGE ACCOUNT  (admin only)
- *    Backblaze body: { provider:'backblaze', keyId, applicationKey, bucketId, bucketName, purpose, label }
- *    MediaFire body:  { provider:'mediafire', email, password, appId, apiKey, folderKey, purpose, label }
+ *    Body: { email, password, appId, apiKey, folderKey, purpose, label }
  * ------------------------------------------------------------------ */
 router.post('/accounts', requireAuth, requireAdmin, async (req, res) => {
-  const { provider, purpose = 'both', label } = req.body;
-  if (!PROVIDERS.includes(provider)) {
-    return res.status(400).json({ error: `provider must be one of ${PROVIDERS.join(', ')}` });
-  }
+  const { purpose = 'both', label, email, password, appId, apiKey, folderKey } = req.body;
   if (!PURPOSES.includes(purpose)) {
     return res.status(400).json({ error: `purpose must be one of ${PURPOSES.join(', ')}` });
   }
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password are required' });
+  }
 
   try {
-    if (provider === 'backblaze') {
-      const { keyId, applicationKey, bucketId, bucketName } = req.body;
-      if (!keyId || !applicationKey || !bucketId || !bucketName) {
-        return res.status(400).json({ error: 'keyId, applicationKey, bucketId, bucketName are required for backblaze' });
-      }
-      // verify the credentials work before saving
-      const info = await b2.authorize({ keyId, applicationKey });
+    const session = await mediafire.getSessionToken({ email, password, appId, apiKey });
+    const info = await mediafire.getAccountInfo({ sessionToken: session.sessionToken });
 
-      const creds = { keyId, applicationKey, bucketId, bucketName };
-      const { data: row, error } = await supabase.from('storage_accounts').insert({
-        provider,
-        label: label || `Backblaze - ${bucketName}`,
-        purpose,
-        credentials_enc: encrypt(JSON.stringify(creds)),
-        external_account_id: info.accountId,
-        last_checked_at: new Date().toISOString()
-      }).select().single();
-      if (error) return res.status(500).json({ error: error.message });
-      return res.json({ account: { id: row.id, label: row.label, provider, purpose: row.purpose } });
-    }
-
-    if (provider === 'mediafire') {
-      const { email, password, appId, apiKey, folderKey } = req.body;
-      if (!email || !password) {
-        return res.status(400).json({ error: 'email and password are required for mediafire' });
-      }
-      const session = await mediafire.getSessionToken({ email, password, appId, apiKey });
-      const info = await mediafire.getAccountInfo({ sessionToken: session.sessionToken });
-
-      const creds = { email, password, appId, apiKey, folderKey };
-      const { data: row, error } = await supabase.from('storage_accounts').insert({
-        provider,
-        label: label || `MediaFire - ${email}`,
-        purpose,
-        credentials_enc: encrypt(JSON.stringify(creds)),
-        last_known_free_bytes: info.limitBytes - info.usedBytes,
-        last_checked_at: new Date().toISOString()
-      }).select().single();
-      if (error) return res.status(500).json({ error: error.message });
-      return res.json({
-        account: { id: row.id, label: row.label, provider, purpose: row.purpose },
-        note: 'Streaming from MediaFire requires a paid MediaFire account for direct_download links; free accounts will get a view-page link instead.'
-      });
-    }
+    const creds = { email, password, appId, apiKey, folderKey };
+    const { data: row, error } = await supabase.from('storage_accounts').insert({
+      provider: 'mediafire',
+      label: label || `MediaFire - ${email}`,
+      purpose,
+      credentials_enc: encrypt(JSON.stringify(creds)),
+      last_known_free_bytes: info.limitBytes - info.usedBytes,
+      last_checked_at: new Date().toISOString()
+    }).select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({
+      account: { id: row.id, label: row.label, provider: 'mediafire', purpose: row.purpose },
+      note: 'Streaming works on free MediaFire accounts too, sharing a 50GB/day direct-download bandwidth pool; a paid MediaFire account keeps streaming working past that daily cap and also gets more storage.'
+    });
   } catch (e) {
-    return res.status(500).json({ error: `${provider} account setup failed: ` + (e.response?.data?.message || e.response?.data?.response?.message || e.message) });
+    return res.status(500).json({ error: 'MediaFire account setup failed: ' + (e.response?.data?.message || e.response?.data?.response?.message || e.message) });
   }
 });
 
@@ -90,41 +60,19 @@ router.get('/accounts', requireAuth, requireAdmin, async (req, res) => {
   const results = await Promise.all(accounts.map(async (acct) => {
     try {
       const creds = loadCreds(acct);
+      const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
+      const info = await mediafire.getAccountInfo({ sessionToken: session.sessionToken });
+      const freeBytes = info.limitBytes - info.usedBytes;
 
-      if (acct.provider === 'backblaze') {
-        // B2 is pay-as-you-go (no fixed quota), so "free space" is tracked
-        // ourselves as an admin-set allocation minus what we've uploaded.
-        const { data: sumRows } = await supabase
-          .from('media_items')
-          .select('file_size_bytes')
-          .eq('storage_account_id', acct.id);
-        const usedBytes = (sumRows || []).reduce((s, r) => s + (r.file_size_bytes || 0), 0);
-        const allocatedBytes = acct.allocated_bytes || null;
-        const freeBytes = allocatedBytes ? Math.max(allocatedBytes - usedBytes, 0) : null;
+      await supabase.from('storage_accounts').update({
+        last_known_free_bytes: freeBytes, last_checked_at: new Date().toISOString()
+      }).eq('id', acct.id);
 
-        return {
-          id: acct.id, label: acct.label, provider: acct.provider, purpose: acct.purpose,
-          usedBytes, allocatedBytes, freeBytes,
-          freeGB: freeBytes !== null ? (freeBytes / 1e9).toFixed(2) : 'unlimited (pay-as-you-go)',
-          status: 'ok'
-        };
-      }
-
-      if (acct.provider === 'mediafire') {
-        const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
-        const info = await mediafire.getAccountInfo({ sessionToken: session.sessionToken });
-        const freeBytes = info.limitBytes - info.usedBytes;
-
-        await supabase.from('storage_accounts').update({
-          last_known_free_bytes: freeBytes, last_checked_at: new Date().toISOString()
-        }).eq('id', acct.id);
-
-        return {
-          id: acct.id, label: acct.label, provider: acct.provider, purpose: acct.purpose,
-          freeBytes, freeGB: (freeBytes / 1e9).toFixed(2),
-          usedBytes: info.usedBytes, totalBytes: info.limitBytes, status: 'ok'
-        };
-      }
+      return {
+        id: acct.id, label: acct.label, provider: acct.provider, purpose: acct.purpose,
+        freeBytes, freeGB: (freeBytes / 1e9).toFixed(2),
+        usedBytes: info.usedBytes, totalBytes: info.limitBytes, status: 'ok'
+      };
     } catch (e) {
       return { id: acct.id, label: acct.label, provider: acct.provider, purpose: acct.purpose, status: 'error', error: e.message };
     }
@@ -133,16 +81,15 @@ router.get('/accounts', requireAuth, requireAdmin, async (req, res) => {
   res.json({ accounts: results.sort((a, b) => (b.freeBytes || Infinity) - (a.freeBytes || Infinity)) });
 });
 
-// Admin: rename/re-tag an account, or (backblaze only) set a manual space allocation
+// Admin: rename/re-tag an account
 router.patch('/accounts/:id', requireAuth, requireAdmin, async (req, res) => {
-  const { purpose, label, allocatedBytes } = req.body;
+  const { purpose, label } = req.body;
   if (purpose && !PURPOSES.includes(purpose)) {
     return res.status(400).json({ error: `purpose must be one of ${PURPOSES.join(', ')}` });
   }
   const update = {};
   if (purpose) update.purpose = purpose;
   if (label) update.label = label;
-  if (allocatedBytes !== undefined) update.allocated_bytes = allocatedBytes;
   if (Object.keys(update).length === 0) return res.status(400).json({ error: 'Nothing to update' });
 
   const { data, error } = await supabase.from('storage_accounts').update(update).eq('id', req.params.id).select().single();
@@ -151,20 +98,16 @@ router.patch('/accounts/:id', requireAuth, requireAdmin, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
- * 3) UPLOAD  (admin picks provider+account, or omits accountId to
- *    auto-pick the best-fitting account of the given provider — or,
- *    if provider is also omitted, the best across BOTH providers)
+ * 3) UPLOAD  (admin picks an account, or omits accountId to
+ *    auto-pick the best-fitting MediaFire account)
  * ------------------------------------------------------------------ */
 router.post('/upload', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file provided' });
-  const { accountId, provider, folder = 'SwarKatha', mediaType } = req.body;
+  const { accountId, mediaType } = req.body;
   const requiredBytes = req.file.size;
 
   if (!mediaType || !['music', 'audio_story'].includes(mediaType)) {
     return res.status(400).json({ error: "mediaType is required and must be 'music' or 'audio_story'" });
-  }
-  if (provider && !PROVIDERS.includes(provider)) {
-    return res.status(400).json({ error: `provider must be one of ${PROVIDERS.join(', ')}` });
   }
 
   let account;
@@ -176,62 +119,33 @@ router.post('/upload', requireAuth, requireAdmin, upload.single('file'), async (
       return res.status(400).json({ error: `This account is dedicated to '${account.purpose}', not '${mediaType}'.` });
     }
   } else {
-    let q = supabase.from('storage_accounts').select('*').eq('is_active', true).in('purpose', [mediaType, 'both']);
-    if (provider) q = q.eq('provider', provider);
-    const { data: accounts } = await q;
+    const { data: accounts } = await supabase
+      .from('storage_accounts').select('*').eq('is_active', true).in('purpose', [mediaType, 'both']);
     if (!accounts || accounts.length === 0) {
-      return res.status(507).json({ error: `No matching '${mediaType}' (or 'both') storage account found${provider ? ` for provider '${provider}'` : ''}` });
+      return res.status(507).json({ error: `No matching '${mediaType}' (or 'both') MediaFire storage account found` });
     }
-    // Simple heuristic: prefer accounts with more last_known_free_bytes; B2
-    // accounts with no allocation set are treated as always-fits.
-    account = accounts.sort((a, b) => (b.last_known_free_bytes ?? Infinity) - (a.last_known_free_bytes ?? Infinity))[0];
+    // Prefer the account with the most last_known_free_bytes.
+    account = accounts.sort((a, b) => (b.last_known_free_bytes ?? 0) - (a.last_known_free_bytes ?? 0))[0];
   }
 
   try {
     const creds = loadCreds(account);
+    const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
+    const uploaded = await mediafire.uploadFile({
+      sessionToken: session.sessionToken,
+      buffer: req.file.buffer,
+      fileName: req.file.originalname,
+      folderKey: creds.folderKey
+    });
 
-    if (account.provider === 'backblaze') {
-      const auth = await b2.authorize({ keyId: creds.keyId, applicationKey: creds.applicationKey });
-      const uploadUrlInfo = await b2.getUploadUrl({ apiUrl: auth.apiUrl, authorizationToken: auth.authorizationToken, bucketId: creds.bucketId });
-      const fileName = `${folder}/${req.file.originalname}`;
-      const uploaded = await b2.uploadFile({
-        uploadUrl: uploadUrlInfo.uploadUrl,
-        uploadAuthToken: uploadUrlInfo.authorizationToken,
-        fileName,
-        buffer: req.file.buffer,
-        contentType: req.file.mimetype
-      });
-
-      return res.json({
-        accountId: account.id,
-        accountLabel: account.label,
-        provider: 'backblaze',
-        storageFileId: uploaded.fileId,
-        storagePath: fileName,
-        sizeBytes: uploaded.contentLength || requiredBytes
-      });
-    }
-
-    if (account.provider === 'mediafire') {
-      const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
-      const uploaded = await mediafire.uploadFile({
-        sessionToken: session.sessionToken,
-        buffer: req.file.buffer,
-        fileName: req.file.originalname,
-        folderKey: creds.folderKey
-      });
-
-      return res.json({
-        accountId: account.id,
-        accountLabel: account.label,
-        provider: 'mediafire',
-        storageFileId: uploaded.quickKey,
-        storagePath: uploaded.fileName,
-        sizeBytes: requiredBytes
-      });
-    }
-
-    return res.status(400).json({ error: `Unsupported provider '${account.provider}'` });
+    return res.json({
+      accountId: account.id,
+      accountLabel: account.label,
+      provider: 'mediafire',
+      storageFileId: uploaded.quickKey,
+      storagePath: uploaded.fileName,
+      sizeBytes: requiredBytes
+    });
   } catch (e) {
     res.status(500).json({ error: 'Upload failed: ' + (e.response?.data?.message || e.message) });
   }
@@ -249,35 +163,42 @@ router.get('/stream-url/:mediaItemId', requireAuth, async (req, res) => {
 
   try {
     const creds = loadCreds(account);
-
-    if (account.provider === 'backblaze') {
-      const auth = await b2.authorize({ keyId: creds.keyId, applicationKey: creds.applicationKey });
-      // Assumes the bucket is private; if it's public, this token is harmless extra info.
-      const token = await b2.getDownloadAuthorization({
-        apiUrl: auth.apiUrl,
-        authorizationToken: auth.authorizationToken,
-        bucketId: creds.bucketId,
-        fileNamePrefix: item.storage_path,
-        validDurationInSeconds: 3600
-      });
-      const url = `${b2.buildFileUrl({ downloadUrl: auth.downloadUrl, bucketName: creds.bucketName, fileName: item.storage_path })}?Authorization=${token}`;
-      return res.json({ url, expiresInSeconds: 3600, provider: 'backblaze' });
-    }
-
-    if (account.provider === 'mediafire') {
-      const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
-      const link = await mediafire.getStreamLink({ sessionToken: session.sessionToken, quickKey: item.storage_file_id });
-      return res.json({
-        url: link.url,
-        direct: link.direct,
-        provider: 'mediafire',
-        note: link.direct ? undefined : 'This is a MediaFire view-page link, not a direct playable stream (requires a paid MediaFire account for direct_download).'
-      });
-    }
-
-    res.status(400).json({ error: `Unsupported provider '${account.provider}'` });
+    const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
+    const link = await mediafire.getStreamLink({ sessionToken: session.sessionToken, quickKey: item.storage_file_id });
+    return res.json({
+      url: link.url,
+      direct: link.direct,
+      freeBandwidthMB: link.freeBandwidthMB,
+      provider: 'mediafire',
+      note: link.direct
+        ? undefined
+        : 'MediaFire could not issue a direct streaming link right now (e.g. this account\'s free 50GB/day direct-download bandwidth may be exhausted for today) — this is a view-page link, not directly playable.'
+    });
   } catch (e) {
     res.status(500).json({ error: 'Failed to resolve stream link: ' + (e.response?.data?.message || e.message) });
+  }
+});
+
+/* ------------------------------------------------------------------
+ * 5) DOWNLOAD LINK  (any logged-in listener) — for saving music/audio
+ *    stories offline, as opposed to stream-url which is for inline
+ *    playback. Works on free MediaFire accounts too, unlike the
+ *    direct_download link stream-url prefers.
+ * ------------------------------------------------------------------ */
+router.get('/download-url/:mediaItemId', requireAuth, async (req, res) => {
+  const { data: item } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
+  if (!item) return res.status(404).json({ error: 'Not found' });
+
+  const { data: account } = await supabase.from('storage_accounts').select('*').eq('id', item.storage_account_id).single();
+  if (!account) return res.status(404).json({ error: 'Storage account not found' });
+
+  try {
+    const creds = loadCreds(account);
+    const session = await mediafire.getSessionToken({ email: creds.email, password: creds.password, appId: creds.appId, apiKey: creds.apiKey });
+    const link = await mediafire.getDownloadLink({ sessionToken: session.sessionToken, quickKey: item.storage_file_id });
+    return res.json({ url: link.url, fileName: link.fileName || item.storage_path, provider: 'mediafire' });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to resolve download link: ' + (e.response?.data?.message || e.message) });
   }
 });
 

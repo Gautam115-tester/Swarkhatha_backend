@@ -18,7 +18,7 @@ router.get('/', requireAuth, async (req, res) => {
 /* ------------------------------------------------------------------
  * Filename/title sanitizer for the story-episode composition rule.
  * Strips underscores (the field separator) and characters that are
- * unsafe as a storage filename (on Backblaze B2 or MediaFire), and
+ * unsafe as a storage filename (on MediaFire), and
  * collapses whitespace. Applied to every segment independently so a
  * story title containing "_" can't be mistaken for an extra field
  * when the parts are later split.
@@ -85,8 +85,8 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
   if (!type || !storageProvider || !storageAccountId || !storageFileId || !storagePath) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
-  if (!['backblaze', 'mediafire'].includes(storageProvider)) {
-    return res.status(400).json({ error: "storageProvider must be 'backblaze' or 'mediafire'" });
+  if (storageProvider !== 'mediafire') {
+    return res.status(400).json({ error: "storageProvider must be 'mediafire'" });
   }
   if (!['music', 'audio_story'].includes(type)) {
     return res.status(400).json({ error: 'type must be music or audio_story' });

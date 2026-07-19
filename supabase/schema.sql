@@ -13,19 +13,16 @@ create table app_users (
   created_at timestamptz default now()
 );
 
--- ============ STORAGE ACCOUNTS (admin-added Backblaze B2 / MediaFire pools) ============
--- credentials_enc holds a JSON blob (shape depends on provider) encrypted at
--- rest by the app layer (see lib/crypto.js) — never store plaintext creds.
---   backblaze -> { keyId, applicationKey, bucketId, bucketName }
+-- ============ STORAGE ACCOUNTS (admin-added MediaFire pools) ============
+-- credentials_enc holds a JSON blob encrypted at rest by the app layer
+-- (see lib/crypto.js) — never store plaintext creds.
 --   mediafire -> { email, password, appId, apiKey, folderKey }
 create table storage_accounts (
   id uuid primary key default uuid_generate_v4(),
-  provider text not null check (provider in ('backblaze','mediafire')),
-  label text not null,                     -- e.g. "Backblaze - swarkatha-media"
+  provider text not null default 'mediafire' check (provider in ('mediafire')),
+  label text not null,                     -- e.g. "MediaFire - main"
   purpose text not null default 'both' check (purpose in ('music','audio_story','both')),
   credentials_enc text not null,
-  external_account_id text,                -- Backblaze accountId, if applicable
-  allocated_bytes bigint,                  -- optional manual cap for Backblaze (pay-as-you-go, no built-in quota)
   is_active boolean default true,
   last_known_free_bytes bigint,
   last_checked_at timestamptz,
@@ -42,10 +39,10 @@ create table media_items (
   cover_image_url text,
   duration_seconds int,
   file_size_bytes bigint,
-  storage_provider text not null check (storage_provider in ('backblaze','mediafire')),
+  storage_provider text not null default 'mediafire' check (storage_provider in ('mediafire')),
   storage_account_id uuid references storage_accounts(id),
-  storage_file_id text not null,           -- B2 fileId, or MediaFire quickkey
-  storage_path text not null,              -- path/filename within that account
+  storage_file_id text not null,           -- MediaFire quickkey
+  storage_path text not null,              -- filename within that account
   category text,                            -- Classical/Bollywood/Folk... or Epic Legends/Historical Dramas...
   chapter_number int,                       -- only for audio_story, ordering within a series
   uploaded_by uuid references app_users(id),

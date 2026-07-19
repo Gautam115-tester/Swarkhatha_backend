@@ -1,8 +1,8 @@
 # SwarKatha — Deployment Guide (Backend)
 
-This covers getting the Phase-1 backend live: Supabase project, Backblaze B2 / MediaFire
-storage accounts, and the Node backend deployed to Render. Do these in order — later
-steps need values from earlier ones.
+This covers getting the Phase-1 backend live: Supabase project, MediaFire storage
+accounts, and the Node backend deployed to Render. Do these in order — later steps
+need values from earlier ones.
 
 ---
 
@@ -10,6 +10,9 @@ steps need values from earlier ones.
 
 1. Go to supabase.com → New Project. Pick a region close to your users, set a strong DB password.
 2. Once created, open **SQL Editor** → New query → paste the contents of `supabase/schema.sql` → Run.
+   Then run `supabase/migration_labels_albums.sql`. If you're upgrading a project that
+   already had Backblaze storage accounts connected, also run
+   `supabase/migration_mediafire_only.sql` last.
 3. Go to **Project Settings → API**. Copy:
    - `Project URL` → this is `SUPABASE_URL`
    - `service_role` key (NOT `anon`) → this is `SUPABASE_SERVICE_ROLE_KEY`
@@ -33,21 +36,14 @@ steps need values from earlier ones.
 
 ## 2. Set up your storage accounts
 
-You don't need to pre-register anything with Render/OAuth here — both providers use
-direct credentials that get sent once to `POST /api/storage/accounts` after the backend
-is deployed (step 4 below). Gather the values now:
+You don't need to pre-register anything with Render/OAuth here — MediaFire uses direct
+credentials that get sent once to `POST /api/storage/accounts` after the backend is
+deployed (step 4 below). Gather the values now:
 
-**Backblaze B2**
-1. Go to backblaze.com → sign up → **B2 Cloud Storage** → create a bucket (private is
-   fine — the backend mints short-lived download tokens per stream request).
-2. **App Keys** → **Add a New Application Key** → scope it to that bucket → copy the
-   `keyID` and `applicationKey` (the applicationKey is only shown once).
-3. Note the bucket's `bucketId` and `bucketName` from the bucket list.
-
-**MediaFire**
-1. Sign up at mediafire.com. **A paid plan is needed if you want listeners to stream
-   directly** — free accounts can still store files, but `stream-url` will only return
-   a view-page link, not a playable one.
+1. Sign up at mediafire.com. Streaming works on **free accounts too** — direct,
+   playable links draw from a shared 50 GB/day bandwidth pool per account. A **paid**
+   plan keeps streaming working once that daily pool is used up, and adds more
+   storage; free accounts still work fine for smaller catalogs/lower traffic.
 2. Go to mediafire.com/developers → register an application → copy the **Application
    ID** and **API Key**.
 
@@ -93,13 +89,12 @@ You should get back a JWT. Use it to connect your first storage account:
 curl -X POST https://<your-service-name>.onrender.com/api/storage/accounts \
   -H "Authorization: Bearer <the JWT>" -H "Content-Type: application/json" \
   -d '{
-    "provider": "backblaze",
-    "keyId": "<applicationKeyId>",
-    "applicationKey": "<applicationKey>",
-    "bucketId": "<bucketId>",
-    "bucketName": "<bucketName>",
+    "email": "you@example.com",
+    "password": "...",
+    "appId": "<application id, from mediafire.com/developers>",
+    "apiKey": "<api key, optional but recommended>",
     "purpose": "both",
-    "label": "Backblaze - main"
+    "label": "MediaFire - main"
   }'
 ```
 Then confirm it's live:
@@ -111,11 +106,11 @@ should list that account with its live free space.
 
 ---
 
-## 5. Repeat for additional accounts (either provider)
+## 5. Repeat for additional accounts
 
-Just call `POST /api/storage/accounts` again with a different provider/credentials.
+Just call `POST /api/storage/accounts` again with different MediaFire credentials.
 Each becomes its own row in `storage_accounts` — no code changes needed to add more
-storage, and you can freely mix Backblaze and MediaFire accounts.
+storage capacity.
 
 ---
 
@@ -124,9 +119,9 @@ storage, and you can freely mix Backblaze and MediaFire accounts.
 | Symptom | Likely cause |
 |---|---|
 | `401 Invalid or expired token` on every request | `JWT_SECRET` differs between when the token was issued and now (e.g. you changed it after deploy) — log in again |
-| MediaFire `stream-url` returns a view-page link instead of a direct one | The connected MediaFire account is on a free plan — `direct_download` links require a paid MediaFire account |
-| Free space always shows stale numbers | `/api/storage/accounts` refreshes on every call for MediaFire; Backblaze free space is based on your own `allocatedBytes` setting (via `PATCH /api/storage/accounts/:id`), since B2 has no built-in quota |
-| Upload returns 507 | No connected account currently has enough free space for that file — add another account, raise `allocatedBytes`, or free up space in an existing one |
-| Backblaze account setup fails immediately | Double-check `keyId`/`applicationKey` are from an **Application Key** (not the master key) scoped to the bucket, and `bucketId`/`bucketName` match exactly |
+| MediaFire `stream-url` returns a view-page link instead of a direct one | This account's shared 50GB/day free direct-download bandwidth pool is likely exhausted for today — wait for the daily reset, or upgrade to a paid MediaFire account to keep streaming past that cap |
+| Free space always shows stale numbers | `/api/storage/accounts` refreshes live from MediaFire on every call, so this shouldn't happen — check the account's credentials are still valid |
+| Upload returns 507 | No connected account currently has enough free space for that file — add another account or free up space in an existing one |
+| MediaFire account setup fails immediately | Double-check the `email`/`password` are correct and, if you supplied `apiKey`, that it matches the `appId` from the same MediaFire developer app |
 
 Next: the Flutter app itself, wired to these endpoints.

@@ -1,7 +1,7 @@
 {
   "name": "swarkatha-backend",
   "version": "1.0.0",
-  "description": "Server-side OAuth + multi-account Backblaze B2 / MediaFire storage router for SwarKatha",
+  "description": "Server-side OAuth + multi-account MediaFire storage router for SwarKatha",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
