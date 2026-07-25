@@ -48,6 +48,38 @@ after the backend is deployed (step 4 below). Gather the values now:
 
 ---
 
+## 2b. Moving cover images to a dedicated Drime account
+
+Cover art (album art + audio-story covers) lives on its own `image`-purpose Drime
+account, kept separate from the `music`/`audio_story`/`both` accounts above — see
+`supabase/migration_image_storage_drime.sql` for why. To set this up:
+
+1. Run `supabase/migration_image_storage_drime.sql` in the Supabase SQL editor
+   (after `migration_labels_albums.sql` and `migration_story_series.sql`).
+2. Make sure `BASE_URL` is set in your backend's env to the real deployed URL —
+   the script below builds every cover's new URL from it.
+3. If you already have covers on an older, Supabase-Storage-backed deployment,
+   run the migration script once from the `backend` folder (needs `SUPABASE_URL`,
+   `SUPABASE_SERVICE_ROLE_KEY`, `TOKEN_ENC_KEY`, `BASE_URL` in your environment —
+   e.g. run this from a Render Shell against the live service, or locally with a
+   `.env` pointed at production):
+   ```bash
+   node scripts/migrate-cover-images-to-drime.js --token=<a Drime personal access token>
+   ```
+   This connects the token as a new `image`-purpose storage account (so it shows up
+   immediately in the admin app's Storage screen with live usage), copies every
+   album/story cover onto it, and rewrites `cover_image_url` everywhere it's used.
+   Add `--dry-run` first to preview with no changes, and `--delete-source` on a
+   later run once you've confirmed covers load correctly, to free up the old
+   Supabase Storage bucket. Run `node scripts/migrate-cover-images-to-drime.js`
+   with no args to see all the flags.
+4. A brand-new project with no existing Supabase-hosted covers doesn't need the
+   script at all — just connect an `image`-purpose account from the admin app's
+   Storage screen ("Add account" → purpose "Cover images") and new uploads will
+   use it automatically.
+
+---
+
 ## 3. Deploy the backend to Render
 
 1. Push the `swarkatha-backend` folder to a GitHub repo.

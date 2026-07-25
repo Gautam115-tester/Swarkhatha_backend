@@ -9,8 +9,13 @@ specifically so that:
   underlying Drime credentials to the client.
 
 Storage runs on **Drime Cloud only**: connect as many Drime accounts as you need, tag
-each one for `music`, `audio_story`, or `both`, and the backend routes uploads,
-streaming and downloads to the right one.
+each one for `music`, `audio_story`, `both`, or `image`, and the backend routes
+uploads, streaming and downloads to the right one. `image`-purpose accounts hold
+cover art (album art + audio-story covers) — kept separate from `both` (which means
+"music & audio_story") so the public cover-image route below can trust an account's
+purpose as its whole authorization check. See `supabase/migration_image_storage_drime.sql`
+and `scripts/migrate-cover-images-to-drime.js` if you're moving covers off an older
+Supabase-Storage-backed deployment.
 
 > Drime's file-bytes endpoint always requires that account's access token on every
 > request — there's no MediaFire-style "direct, credential-free" link type. So instead
@@ -35,6 +40,8 @@ streaming and downloads to the right one.
 | GET | `/api/storage/download-url/:mediaItemId` | any logged-in user | resolves a short-lived offline-download URL |
 | GET | `/api/storage/stream/:mediaItemId` | signed URL or logged-in user | proxies the actual playback bytes from Drime |
 | GET | `/api/storage/file/:mediaItemId` | signed URL or logged-in user | proxies the actual download bytes from Drime (forces `Content-Disposition: attachment`) |
+| POST | `/api/storage/upload-image` | admin | uploads a cover image; auto-picks (or uses `accountId` for) an `image`-purpose account |
+| GET | `/api/storage/cover/:accountId/:hash` | public, no auth | proxies cover-image bytes from Drime — safe because `accountId` must be `purpose: 'image'` |
 | GET/POST/DELETE | `/api/media` | mixed | catalog CRUD, favorites, resume progress |
 
 ## Adding a storage account (admin flow)

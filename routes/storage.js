@@ -5,13 +5,17 @@ const { encrypt, decrypt } = require('../lib/crypto');
 const { requireAuth, requireAdmin, signMediaToken, requireMediaAccess } = require('../middleware/auth');
 const drime = require('../lib/drime');
 const liveMonitor = require('../lib/liveAccountsMonitor');
-const imageStorage = require('../lib/imageStorage');
+const coverImageStorage = require('../lib/coverImageStorage');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } }); // 1GB cap
 const uploadImage = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB cap for cover images
 
-const PURPOSES = ['music', 'audio_story', 'both'];
+// 'image' is its own purpose, deliberately separate from 'both' (which
+// has always meant "music & audio_story") — see
+// migration_image_storage_drime.sql for why that separation matters for
+// the public cover proxy route below.
+const PURPOSES = ['music', 'audio_story', 'both', 'image'];
 const STREAM_TOKEN_TTL_SECONDS = Number(process.env.STREAM_TOKEN_TTL_SECONDS || 900); // 15 min
 
 function loadCreds(account) {
@@ -215,8 +219,10 @@ router.post('/upload', requireAuth, requireAdmin, upload.single('file'), async (
 /* ------------------------------------------------------------------
  * 3b) UPLOAD COVER IMAGE  (admin only)
  *    Body: multipart field 'image' (jpg/png/webp/gif, 10MB cap) +
- *    field 'kind' = 'album' | 'story' (just a storage-path prefix,
- *    purely cosmetic in the Supabase dashboard).
+ *    field 'kind' = 'album' | 'story' (just a filename hint) +
+ *    optional field 'accountId' to pin a specific 'image'-purpose
+ *    Drime account instead of auto-picking the one with the most
+ *    free space.
  *
  *    Used for both flows:
  *      - music: the admin app uploads the track's embedded cover art
@@ -226,17 +232,77 @@ router.post('/upload', requireAuth, requireAdmin, upload.single('file'), async (
  *        files are almost always untagged raw recordings) only when
  *        starting a *new* story; existing stories already have one.
  *
- *    Either way, all images end up in Supabase Storage — see
- *    lib/imageStorage.js — never on Drime, which is audio-only.
+ *    Cover images live on a dedicated 'image'-purpose Drime account —
+ *    see lib/coverImageStorage.js and migration_image_storage_drime.sql
+ *    (previously: a public Supabase Storage bucket). The returned
+ *    `url` points at this backend's own public GET /cover/:accountId/
+ *    :hash route below, since Drime itself has no credential-free
+ *    direct-link type (same reason stream/download are proxied).
  * ------------------------------------------------------------------ */
 router.post('/upload-image', requireAuth, requireAdmin, uploadImage.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No image provided' });
   const prefix = req.body.kind === 'story' ? 'story' : 'album';
   try {
-    const url = await imageStorage.uploadImage({ buffer: req.file.buffer, prefix });
-    res.json({ url });
+    const uploaded = await coverImageStorage.uploadImage({
+      buffer: req.file.buffer,
+      prefix,
+      accountId: req.body.accountId || undefined
+    });
+    res.json({
+      url: `${baseUrl(req)}/api/storage/cover/${uploaded.accountId}/${uploaded.storageHash}`,
+      accountId: uploaded.accountId,
+      storageFileId: uploaded.storageFileId,
+      storageHash: uploaded.storageHash,
+      sizeBytes: uploaded.sizeBytes
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------
+ * 3c) SERVE COVER IMAGE  (public, no auth)
+ *    Drime's file-bytes endpoint always needs a Bearer token, so this
+ *    proxies it server-side — same shape as /stream and /file below,
+ *    except deliberately UNAUTHENTICATED: cover art was a public
+ *    Supabase Storage URL before this migration, and every screen in
+ *    both Flutter apps (CachedNetworkImage etc.) already just hits
+ *    `coverImageUrl` directly with no auth headers attached. Making
+ *    this route require a token would mean touching every image
+ *    widget in both apps just to add headers.
+ *
+ *    This is safe specifically BECAUSE `accountId` must resolve to an
+ *    account whose purpose is exactly 'image' (never 'both', which
+ *    holds real music/audio_story files) — see the comment on
+ *    PURPOSES above and in migration_image_storage_drime.sql. An
+ *    'image'-purpose account should only ever contain cover art, so
+ *    this route can never be used to pull gated audio off Drime.
+ * ------------------------------------------------------------------ */
+router.get('/cover/:accountId/:hash', async (req, res) => {
+  const { data: account } = await supabase.from('storage_accounts').select('*').eq('id', req.params.accountId).single();
+  if (!account || account.purpose !== 'image' || !account.is_active) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
+  try {
+    const creds = loadCreds(account);
+    const upstream = await drime.getFileStream({ accessToken: creds.accessToken, hash: req.params.hash });
+    if (upstream.status >= 400) {
+      return res.status(404).json({ error: 'Image not found' });
+    }
+
+    res.status(upstream.status);
+    for (const header of ['content-type', 'content-length']) {
+      if (upstream.headers[header]) res.setHeader(header, upstream.headers[header]);
+    }
+    // One year: every upload gets a fresh, unique filename and is never
+    // overwritten in place, so a cached copy under this exact
+    // accountId+hash URL can never go stale. Matches the old Supabase
+    // Storage bucket's cache policy exactly.
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    upstream.data.pipe(res);
+  } catch (e) {
+    res.status(503).json({ error: 'Failed to resolve image from Drime: ' + (e.response?.data?.message || e.message) });
   }
 });
 
