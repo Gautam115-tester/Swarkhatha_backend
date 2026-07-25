@@ -233,7 +233,7 @@ router.post('/upload-image', requireAuth, requireAdmin, uploadImage.single('imag
   if (!req.file) return res.status(400).json({ error: 'No image provided' });
   const prefix = req.body.kind === 'story' ? 'story' : 'album';
   try {
-    const url = await imageStorage.uploadImage({ buffer: req.file.buffer, mime: req.file.mimetype, prefix });
+    const url = await imageStorage.uploadImage({ buffer: req.file.buffer, prefix });
     res.json({ url });
   } catch (e) {
     res.status(500).json({ error: e.message });
