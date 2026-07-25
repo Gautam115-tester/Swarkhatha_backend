@@ -6,6 +6,8 @@ const { requireAuth, requireAdmin, signMediaToken, requireMediaAccess } = requir
 const drime = require('../lib/drime');
 const liveMonitor = require('../lib/liveAccountsMonitor');
 const coverImageStorage = require('../lib/coverImageStorage');
+const imageCache = require('../lib/imageCache');
+const accountCache = require('../lib/accountCache');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } }); // 1GB cap
@@ -24,6 +26,20 @@ function loadCreds(account) {
 
 function baseUrl(req) {
   return process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
+}
+
+// Cover images are the one thing worth putting behind a free CDN/edge
+// cache (see /cdn-worker) — a fixed image, requested over and over by
+// thousands of listeners, is exactly what edge caching is for, and it
+// takes that traffic off this Render instance (and Drime) entirely once
+// warm. When IMAGE_CDN_BASE_URL is set, newly-uploaded covers get a URL
+// pointing at that CDN instead of straight at this backend; the
+// underlying GET /cover/:accountId/:hash route below still works
+// standalone either way, so this is purely additive — nothing breaks if
+// it's left unset. scripts/repoint-cover-urls-to-cdn.js updates
+// already-uploaded covers to match once this is configured.
+function coverBaseUrl(req) {
+  return process.env.IMAGE_CDN_BASE_URL || baseUrl(req);
 }
 
 /* ------------------------------------------------------------------
@@ -157,6 +173,7 @@ router.patch('/accounts/:id', requireAuth, requireAdmin, async (req, res) => {
 
   const { data, error } = await supabase.from('storage_accounts').update(update).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
+  accountCache.invalidate(req.params.id); // see lib/accountCache.js — don't wait out the TTL on an edit
   res.json({ account: data });
 });
 
@@ -249,7 +266,7 @@ router.post('/upload-image', requireAuth, requireAdmin, uploadImage.single('imag
       accountId: req.body.accountId || undefined
     });
     res.json({
-      url: `${baseUrl(req)}/api/storage/cover/${uploaded.accountId}/${uploaded.storageHash}`,
+      url: `${coverBaseUrl(req)}/api/storage/cover/${uploaded.accountId}/${uploaded.storageHash}`,
       accountId: uploaded.accountId,
       storageFileId: uploaded.storageFileId,
       storageHash: uploaded.storageHash,
@@ -277,33 +294,63 @@ router.post('/upload-image', requireAuth, requireAdmin, uploadImage.single('imag
  *    PURPOSES above and in migration_image_storage_drime.sql. An
  *    'image'-purpose account should only ever contain cover art, so
  *    this route can never be used to pull gated audio off Drime.
+ *
+ *    PERFORMANCE: unlike /stream and /file below, this does NOT stream
+ *    straight through to Drime on every request. Cover images are
+ *    small and immutable per URL (a fresh hash is minted on every
+ *    upload — see lib/coverImageStorage.js), which makes them ideal to
+ *    cache in full:
+ *      - accountCache avoids a Supabase round trip on every request
+ *        for the account row (see lib/accountCache.js).
+ *      - imageCache holds the actual image bytes in memory, keyed by
+ *        accountId+hash, so a second request for the same cover —
+ *        from any user — never touches Drime at all (see
+ *        lib/imageCache.js, including in-flight request coalescing).
+ *    Put a CDN/edge cache in front of this route too (see
+ *    /cdn-worker) and the large majority of requests never reach this
+ *    instance in the first place, which also sidesteps Render free-tier
+ *    cold starts for anything already warmed at the edge.
  * ------------------------------------------------------------------ */
 router.get('/cover/:accountId/:hash', async (req, res) => {
-  const { data: account } = await supabase.from('storage_accounts').select('*').eq('id', req.params.accountId).single();
+  const { accountId, hash } = req.params;
+  const account = await accountCache.getAccount(accountId);
   if (!account || account.purpose !== 'image' || !account.is_active) {
     return res.status(404).json({ error: 'Not found' });
   }
 
   try {
-    const creds = loadCreds(account);
-    const upstream = await drime.getFileStream({ accessToken: creds.accessToken, hash: req.params.hash });
-    if (upstream.status >= 400) {
-      return res.status(404).json({ error: 'Image not found' });
-    }
+    const cacheKey = `${accountId}:${hash}`;
+    const { buffer, contentType } = await imageCache.getOrFetch(cacheKey, async () => {
+      const creds = loadCreds(account);
+      const file = await drime.getFileBuffer({ accessToken: creds.accessToken, hash });
+      return { buffer: file.buffer, contentType: file.contentType, size: file.buffer.length };
+    });
 
-    res.status(upstream.status);
-    for (const header of ['content-type', 'content-length']) {
-      if (upstream.headers[header]) res.setHeader(header, upstream.headers[header]);
-    }
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Length', buffer.length);
     // One year: every upload gets a fresh, unique filename and is never
     // overwritten in place, so a cached copy under this exact
     // accountId+hash URL can never go stale. Matches the old Supabase
-    // Storage bucket's cache policy exactly.
+    // Storage bucket's cache policy exactly, and is what makes the
+    // in-memory cache above (and any CDN in front of this route) safe
+    // to hold onto indefinitely.
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    upstream.data.pipe(res);
+    res.status(200).send(buffer);
   } catch (e) {
+    if (e.status === 404) {
+      return res.status(404).json({ error: 'Image not found' });
+    }
     res.status(503).json({ error: 'Failed to resolve image from Drime: ' + (e.response?.data?.message || e.message) });
   }
+});
+
+/* ------------------------------------------------------------------
+ * 3d) IMAGE CACHE STATS  (admin only) — sanity-check that the
+ *    in-memory cover cache from 3c is actually filling up/being hit,
+ *    without needing Render shell access.
+ * ------------------------------------------------------------------ */
+router.get('/image-cache-stats', requireAuth, requireAdmin, (req, res) => {
+  res.json(imageCache.stats());
 });
 
 /* ------------------------------------------------------------------

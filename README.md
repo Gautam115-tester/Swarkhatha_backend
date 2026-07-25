@@ -128,7 +128,9 @@ npm start     # production
 ```
 
 See `DEPLOYMENT.md` for deploying this to Render alongside the storage account setup
-steps.
+steps. If cover images are loading slowly, see `IMAGE_PERFORMANCE.md` — a set of
+free, no-new-cost changes (server-side caching + an optional CDN edge cache) that
+fix that without moving off Supabase/Render/Drime.
 
 ## What's NOT in this phase yet
 - The Flutter app itself (player UI, admin upload screen, equalizer wiring)
