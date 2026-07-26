@@ -31,12 +31,25 @@ device, for every image — which at your scale is most loads.
 
 ## What changed (already in this codebase, no cost)
 
-- **`lib/imageCache.js`** — an in-memory cache that holds actual cover
-  image bytes. The first time anyone requests a given cover, it's
+- **`lib/coverImageCache.js`** — an in-memory cache that holds actual
+  cover image bytes, strictly capped at 50MB total (any single image
+  bigger than that is served but not cached, so it can't wipe out the
+  rest of the cache). The first time anyone requests a given cover, it's
   fetched from Drime and cached; every request after that (from any
   user) is served straight from memory. Includes request coalescing, so
   if 50 users open a newly-published album in the same second, that's
   one Drime fetch, not 50.
+- **`lib/mediaItemCache.js`** — caches the lightweight `media_items` row
+  lookup (title, storage hash, account id, cover path, etc — never the
+  audio/video bytes themselves) that `/stream-url`, `/download-url`, and
+  the `/stream` and `/file` proxy routes each need on every request,
+  including every seek/scrub. Capped at 10MB with a 6-hour TTL — long,
+  because both write paths that can change a cached row (delete, and an
+  admin re-covering an album/story, which propagates a new cover onto
+  every existing track/episode) call `invalidate()` explicitly for every
+  affected id the moment the write happens, so correctness doesn't
+  depend on the TTL for the cases actually expected to occur. The TTL is
+  just a distant backstop for anything unanticipated.
 - **`lib/accountCache.js`** — removes the Supabase database round-trip
   that used to run on *every* image request just to look up which Drime
   account and credentials to use.
@@ -45,7 +58,11 @@ device, for every image — which at your scale is most loads.
   and cover images are fetched as a single buffered download rather than
   a proxied stream, so they're cacheable.
 - These are all in-process changes — nothing to configure, they take
-  effect on your next deploy.
+  effect on your next deploy. Both caches' hard caps mean the memory
+  they can ever add is fixed (50MB + 10MB) regardless of how many of
+  your 10,000 users hit the service at once — that ceiling is what
+  keeps caching itself from ever being the thing that OOMs a Render
+  instance.
 
 **On their own, these fix the "one popular image is slow for everyone"
 problem, but not the cold-start problem** — the very first request after
@@ -126,4 +143,6 @@ sizing are covered separately in the app README.
 After deploying the backend changes, `GET /api/storage/image-cache-stats`
 (admin JWT required) shows how many images and bytes are currently held
 in the in-memory cache — a rising `entries` count as users browse
-confirms the cache is being hit.
+confirms the cache is being hit. `GET /api/storage/media-item-cache-stats`
+shows the same thing for the metadata lookup cache (also `hits`,
+`misses`, `evictions`, and `expirations`).

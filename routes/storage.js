@@ -6,8 +6,9 @@ const { requireAuth, requireAdmin, signMediaToken, requireMediaAccess } = requir
 const drime = require('../lib/drime');
 const liveMonitor = require('../lib/liveAccountsMonitor');
 const coverImageStorage = require('../lib/coverImageStorage');
-const imageCache = require('../lib/imageCache');
+const coverImageCache = require('../lib/coverImageCache');
 const accountCache = require('../lib/accountCache');
+const mediaItemCache = require('../lib/mediaItemCache');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } }); // 1GB cap
@@ -302,10 +303,11 @@ router.post('/upload-image', requireAuth, requireAdmin, uploadImage.single('imag
  *    cache in full:
  *      - accountCache avoids a Supabase round trip on every request
  *        for the account row (see lib/accountCache.js).
- *      - imageCache holds the actual image bytes in memory, keyed by
- *        accountId+hash, so a second request for the same cover —
+ *      - coverImageCache holds the actual image bytes in memory, keyed
+ *        by accountId+hash, so a second request for the same cover —
  *        from any user — never touches Drime at all (see
- *        lib/imageCache.js, including in-flight request coalescing).
+ *        lib/coverImageCache.js, including in-flight request
+ *        coalescing and the strict 50MB memory cap).
  *    Put a CDN/edge cache in front of this route too (see
  *    /cdn-worker) and the large majority of requests never reach this
  *    instance in the first place, which also sidesteps Render free-tier
@@ -320,7 +322,7 @@ router.get('/cover/:accountId/:hash', async (req, res) => {
 
   try {
     const cacheKey = `${accountId}:${hash}`;
-    const { buffer, contentType } = await imageCache.getOrFetch(cacheKey, async () => {
+    const { buffer, contentType } = await coverImageCache.getOrFetch(cacheKey, async () => {
       const creds = loadCreds(account);
       const file = await drime.getFileBuffer({ accessToken: creds.accessToken, hash });
       return { buffer: file.buffer, contentType: file.contentType, size: file.buffer.length };
@@ -350,7 +352,17 @@ router.get('/cover/:accountId/:hash', async (req, res) => {
  *    without needing Render shell access.
  * ------------------------------------------------------------------ */
 router.get('/image-cache-stats', requireAuth, requireAdmin, (req, res) => {
-  res.json(imageCache.stats());
+  res.json(coverImageCache.stats());
+});
+
+/* ------------------------------------------------------------------
+ * 3e) MEDIA ITEM (metadata) CACHE STATS  (admin only) — same purpose
+ *    as 3d, for lib/mediaItemCache.js (the media_items row lookup
+ *    cache used by stream-url, download-url, and the stream/file
+ *    proxy below).
+ * ------------------------------------------------------------------ */
+router.get('/media-item-cache-stats', requireAuth, requireAdmin, (req, res) => {
+  res.json(mediaItemCache.stats());
 });
 
 /* ------------------------------------------------------------------
@@ -364,7 +376,10 @@ router.get('/image-cache-stats', requireAuth, requireAdmin, (req, res) => {
  *    which fetches from Drime server-side and pipes the bytes through.
  * ------------------------------------------------------------------ */
 router.get('/stream-url/:mediaItemId', requireAuth, async (req, res) => {
-  const { data: item } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
+  const item = await mediaItemCache.getOrFetch(req.params.mediaItemId, async () => {
+    const { data } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
+    return data || null;
+  });
   if (!item) return res.status(404).json({ error: 'Not found' });
   if (!item.storage_hash) return res.status(500).json({ error: 'This item has no storage_hash on file — was it uploaded before the Drime migration?' });
 
@@ -383,7 +398,10 @@ router.get('/stream-url/:mediaItemId', requireAuth, async (req, res) => {
  *    attachment header so it saves rather than plays inline).
  * ------------------------------------------------------------------ */
 router.get('/download-url/:mediaItemId', requireAuth, async (req, res) => {
-  const { data: item } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
+  const item = await mediaItemCache.getOrFetch(req.params.mediaItemId, async () => {
+    const { data } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
+    return data || null;
+  });
   if (!item) return res.status(404).json({ error: 'Not found' });
   if (!item.storage_hash) return res.status(500).json({ error: 'This item has no storage_hash on file — was it uploaded before the Drime migration?' });
 
@@ -403,7 +421,13 @@ router.get('/download-url/:mediaItemId', requireAuth, async (req, res) => {
  *    Range so audio players can seek/scrub during playback.
  * ------------------------------------------------------------------ */
 async function proxyMedia(req, res, { forceDownload }) {
-  const { data: item } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
+  // This runs on every stream/seek/download request (range requests for
+  // scrubbing re-hit this route repeatedly for the same id), so it's the
+  // hottest of the three media_items lookups — see lib/mediaItemCache.js.
+  const item = await mediaItemCache.getOrFetch(req.params.mediaItemId, async () => {
+    const { data } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
+    return data || null;
+  });
   if (!item) return res.status(404).json({ error: 'Not found' });
   if (!item.storage_hash) return res.status(500).json({ error: 'This item has no storage_hash on file' });
 

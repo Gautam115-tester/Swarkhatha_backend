@@ -3,6 +3,7 @@ const supabase = require('../lib/supabaseClient');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { decrypt } = require('../lib/crypto');
 const drime = require('../lib/drime');
+const mediaItemCache = require('../lib/mediaItemCache');
 
 const router = express.Router();
 
@@ -192,11 +193,17 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
       // existed, so the whole album is consistent going forward.
       insertRow.cover_image_url = album.cover_image_url || coverImageUrl || null;
       if (album.cover_image_url) {
-        const { error: backfillErr } = await supabase.from('media_items')
+        const { data: backfilled, error: backfillErr } = await supabase.from('media_items')
           .update({ cover_image_url: album.cover_image_url })
           .eq('album_id', album.id)
-          .is('cover_image_url', null);
+          .is('cover_image_url', null)
+          .select('id');
         if (backfillErr) console.error('[media create] album cover backfill failed (continuing):', backfillErr.message);
+        // Bulk updates like this bypass the single-id DELETE invalidation
+        // in mediaItemCache — invalidate every row actually touched so a
+        // long-TTL cache (see lib/mediaItemCache.js) can't keep serving
+        // the old (null) cover_image_url for up to TTL_MS.
+        else if (backfilled) backfilled.forEach((row) => mediaItemCache.invalidate(row.id));
       }
     } catch (e) {
       return res.status(500).json({ error: 'Album lookup/create failed: ' + e.message });
@@ -219,10 +226,15 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
       // this series too, so a manual re-cover takes effect everywhere
       // immediately, not just for episodes uploaded from now on.
       if (coverImageUrl) {
-        const { error: propErr } = await supabase.from('media_items')
+        const { data: propagated, error: propErr } = await supabase.from('media_items')
           .update({ cover_image_url: coverImageUrl })
-          .eq('story_series_id', series.id);
+          .eq('story_series_id', series.id)
+          .select('id');
         if (propErr) console.error('[media create] story cover propagation failed (continuing):', propErr.message);
+        // Same reasoning as the album backfill above — this can touch
+        // many existing episodes at once, so each affected id needs an
+        // explicit invalidate() rather than waiting out the cache TTL.
+        else if (propagated) propagated.forEach((row) => mediaItemCache.invalidate(row.id));
       }
     } catch (e) {
       return res.status(500).json({ error: 'Story series lookup/create failed: ' + e.message });
@@ -331,6 +343,7 @@ router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
 
   const { error } = await supabase.from('media_items').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
+  mediaItemCache.invalidate(req.params.id); // don't let a deleted item keep resolving from cache — see lib/mediaItemCache.js
   res.json({ ok: true });
 });
 
