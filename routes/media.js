@@ -7,6 +7,30 @@ const mediaItemCache = require('../lib/mediaItemCache');
 
 const router = express.Router();
 
+// Supabase/PostgREST caps every single request at the project's max-rows
+// setting (1000 by default) regardless of how the query is built — there
+// is no "just select everything" escape hatch. Once media_items passed
+// ~1000 rows, plain select('*') queries started silently truncating,
+// which is why whole story series were disappearing from the app: their
+// episodes all landed past the 1000-row cutoff of the default
+// created_at-desc ordering and were simply never in the response.
+// This pages through in PAGE_SIZE chunks via .range() and concatenates
+// until a page comes back short, so callers always get the complete
+// result set no matter how large the table grows.
+const PAGE_SIZE = 1000;
+async function fetchAllRows(buildQuery) {
+  let all = [];
+  let from = 0;
+  while (true) {
+    const { data, error } = await buildQuery().range(from, from + PAGE_SIZE - 1);
+    if (error) throw new Error(error.message);
+    all = all.concat(data || []);
+    if (!data || data.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+  return all;
+}
+
 // Public catalog (any logged-in listener)
 //
 // albumId / storySeriesId are the two filters the player needs to build
@@ -20,15 +44,25 @@ const router = express.Router();
 // real, authoritative episode order).
 router.get('/', requireAuth, async (req, res) => {
   const { type, category, albumId, storySeriesId } = req.query;
-  let q = supabase.from('media_items').select('*');
-  if (type) q = q.eq('type', type);
-  if (category) q = q.eq('category', category);
-  if (albumId) q = q.eq('album_id', albumId).order('created_at', { ascending: true });
-  else if (storySeriesId) q = q.eq('story_series_id', storySeriesId).order('chapter_number', { ascending: true });
-  else q = q.order('created_at', { ascending: false });
-  const { data, error } = await q;
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ items: data });
+
+  const orderColumn = storySeriesId ? 'chapter_number' : 'created_at';
+  const ascending = Boolean(albumId || storySeriesId);
+
+  const buildQuery = () => {
+    let q = supabase.from('media_items').select('*');
+    if (type) q = q.eq('type', type);
+    if (category) q = q.eq('category', category);
+    if (albumId) q = q.eq('album_id', albumId);
+    else if (storySeriesId) q = q.eq('story_series_id', storySeriesId);
+    return q.order(orderColumn, { ascending });
+  };
+
+  try {
+    const data = await fetchAllRows(buildQuery);
+    res.json({ items: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 /* ------------------------------------------------------------------
@@ -292,12 +326,16 @@ router.get('/stories/:id/episodes', requireAuth, async (req, res) => {
   if (seriesErr) return res.status(500).json({ error: seriesErr.message });
   if (!series) return res.status(404).json({ error: 'Story series not found' });
 
-  const { data, error } = await supabase
-    .from('media_items')
-    .select('*')
-    .eq('story_series_id', req.params.id)
-    .order('chapter_number', { ascending: true });
-  if (error) return res.status(500).json({ error: error.message });
+  let data;
+  try {
+    data = await fetchAllRows(() =>
+      supabase.from('media_items').select('*')
+        .eq('story_series_id', req.params.id)
+        .order('chapter_number', { ascending: true })
+    );
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
 
   const episodes = data.map((m) => ({
     id: m.id,
