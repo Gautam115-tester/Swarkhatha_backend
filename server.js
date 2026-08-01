@@ -6,6 +6,7 @@ const authRoutes = require('./routes/auth');
 const storageRoutes = require('./routes/storage');
 const mediaRoutes = require('./routes/media');
 const labelsRoutes = require('./routes/labels');
+const usersRoutes = require('./routes/users');
 
 const app = express();
 app.use(cors());
@@ -17,6 +18,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/storage', storageRoutes);
 app.use('/api/media', mediaRoutes);
 app.use('/api/labels', labelsRoutes);
+app.use('/api/users', usersRoutes);
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
