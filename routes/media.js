@@ -360,6 +360,38 @@ router.get('/stories/:id/episodes', requireAuth, async (req, res) => {
   });
 });
 
+// Same "is this episode still worth resuming" threshold AppState uses on
+// the Flutter client (see AppState._resumableCeiling) -- kept in sync by
+// hand since there's no shared config between the two codebases. An
+// episode at or past this fraction played is treated as finished rather
+// than in-progress.
+const RESUMABLE_CEILING = 0.95;
+
+// "34s" for under a minute, "2m" for under an hour, "1h 5m" beyond that --
+// remaining-time label for the /continue-listening response.
+function formatRemainingTime(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM > 0 ? `${h}h ${remM}m` : `${h}h`;
+}
+
+// "just now" / "3 minutes ago" / "2 hours ago" / "1 day ago" -- how long
+// since an ISO timestamp, for the /continue-listening response.
+function formatTimeAgo(isoString) {
+  const diffSec = Math.max(0, Math.floor((Date.now() - new Date(isoString).getTime()) / 1000));
+  if (diffSec < 60) return 'just now';
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin} minute${diffMin === 1 ? '' : 's'} ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr} hour${diffHr === 1 ? '' : 's'} ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay} day${diffDay === 1 ? '' : 's'} ago`;
+}
+
 // All of the current listener's saved playback positions (audio stories
 // only -- see PlaybackHandler on the Flutter side, music never writes a
 // resume checkpoint). Returned as plain rows rather than joined against
@@ -381,6 +413,90 @@ router.get('/progress', requireAuth, async (req, res) => {
       updatedAt: r.updated_at
     }))
   });
+});
+
+// Netflix-style "Continue Playing" row, computed server-side. NOTE: the
+// Flutter listener app does NOT call this today -- it already has the full
+// catalog loaded locally and does this same grouping client-side (see
+// AppState.continuePlayingStories), which avoids an extra round trip. This
+// endpoint exists to match the agreed API design 1:1 for any other client
+// (a future web/TV app, admin dashboard, etc.) that doesn't already have
+// the catalog in memory. One entry per story series -- whichever episode
+// was most recently left partway through -- sorted most-recent-first.
+// Finished (or basically finished, >=95% played) episodes are dropped
+// entirely, same threshold the Flutter client already uses.
+router.get('/continue-listening', requireAuth, async (req, res) => {
+  const { data: progressRows, error: progressErr } = await supabase
+    .from('play_progress')
+    .select('media_item_id, position_seconds, updated_at')
+    .eq('user_id', req.user.sub);
+  if (progressErr) return res.status(500).json({ error: progressErr.message });
+  if (!progressRows.length) return res.json([]);
+
+  const { data: items, error: itemsErr } = await supabase
+    .from('media_items')
+    .select('id, title, episode_title, chapter_number, cover_image_url, duration_seconds, album_or_series, story_series_id')
+    .in('id', progressRows.map((r) => r.media_item_id))
+    .eq('type', 'audio_story');
+  if (itemsErr) return res.status(500).json({ error: itemsErr.message });
+  const itemById = new Map(items.map((m) => [m.id, m]));
+
+  const bySeriesKey = new Map();
+  for (const row of progressRows) {
+    const item = itemById.get(row.media_item_id);
+    if (!item) continue; // music, or the item was deleted since
+    const duration = item.duration_seconds;
+    if (!duration || duration <= 0) continue;
+    const fraction = row.position_seconds / duration;
+    if (fraction <= 0 || fraction >= RESUMABLE_CEILING) continue; // never started, or basically finished
+
+    const key = item.story_series_id || item.album_or_series || item.id;
+    const existing = bySeriesKey.get(key);
+    if (!existing || new Date(row.updated_at) > new Date(existing.row.updated_at)) {
+      bySeriesKey.set(key, { row, item });
+    }
+  }
+
+  const result = Array.from(bySeriesKey.values())
+    .sort((a, b) => new Date(b.row.updated_at) - new Date(a.row.updated_at))
+    .map(({ row, item }) => ({
+      story_id: item.story_series_id || item.id,
+      episode_id: item.id,
+      title: item.album_or_series || item.title,
+      episode: `S1 E${item.chapter_number ?? ''}`,
+      episode_title: item.episode_title || null,
+      thumbnail: item.cover_image_url,
+      duration: item.duration_seconds,
+      current_position: row.position_seconds,
+      remaining_time: formatRemainingTime(item.duration_seconds - row.position_seconds),
+      completion_percentage: Math.round((row.position_seconds / item.duration_seconds) * 100),
+      last_played: formatTimeAgo(row.updated_at)
+    }));
+
+  res.json(result);
+});
+
+// Convenience alias for PUT /:id/progress using the flatter request shape
+// from the Continue Listening spec (episode_id/current_position in the
+// body instead of :id as a route param). Writes to the exact same
+// play_progress row, so a client can use whichever shape is more
+// convenient -- both feed /progress and /continue-listening identically.
+// `duration` and `story_id` in the request are accepted but not stored
+// separately: duration is already known from media_items.duration_seconds,
+// and story_id is derivable from the episode's story_series_id.
+router.post('/save-progress', requireAuth, async (req, res) => {
+  const { episode_id, current_position } = req.body;
+  if (!episode_id || current_position == null) {
+    return res.status(400).json({ error: 'episode_id and current_position are required' });
+  }
+  const { error } = await supabase.from('play_progress').upsert({
+    user_id: req.user.sub,
+    media_item_id: episode_id,
+    position_seconds: current_position,
+    updated_at: new Date().toISOString()
+  });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
 });
 
 router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
