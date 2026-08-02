@@ -379,8 +379,12 @@ function formatRemainingTime(seconds) {
   return remM > 0 ? `${h}h ${remM}m` : `${h}h`;
 }
 
-// "just now" / "3 minutes ago" / "2 hours ago" / "1 day ago" -- how long
-// since an ISO timestamp, for the /continue-listening response.
+// "just now" / "3 minutes ago" / "2 hours ago" / "45 days ago" / "2 years
+// ago" -- how long since an ISO timestamp, for the /continue-listening
+// response. Stays in whole days through day 364, then rolls over into
+// whole years from day 365 on, matching the Flutter client's
+// formatRelativeTime (duration_format.dart) so the two never disagree if
+// a future client (web/admin) starts using this endpoint.
 function formatTimeAgo(isoString) {
   const diffSec = Math.max(0, Math.floor((Date.now() - new Date(isoString).getTime()) / 1000));
   if (diffSec < 60) return 'just now';
@@ -389,7 +393,9 @@ function formatTimeAgo(isoString) {
   const diffHr = Math.floor(diffMin / 60);
   if (diffHr < 24) return `${diffHr} hour${diffHr === 1 ? '' : 's'} ago`;
   const diffDay = Math.floor(diffHr / 24);
-  return `${diffDay} day${diffDay === 1 ? '' : 's'} ago`;
+  if (diffDay < 365) return `${diffDay} day${diffDay === 1 ? '' : 's'} ago`;
+  const diffYear = Math.floor(diffDay / 365);
+  return `${diffYear} year${diffYear === 1 ? '' : 's'} ago`;
 }
 
 // All of the current listener's saved playback positions (audio stories
