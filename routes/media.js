@@ -360,6 +360,29 @@ router.get('/stories/:id/episodes', requireAuth, async (req, res) => {
   });
 });
 
+// All of the current listener's saved playback positions (audio stories
+// only -- see PlaybackHandler on the Flutter side, music never writes a
+// resume checkpoint). Returned as plain rows rather than joined against
+// media_items: the app always already has the full catalog loaded
+// locally and matches by id, the same division of labour the client
+// already uses for series/album grouping (see episodesFor/audioSeries in
+// app_state.dart). Powers the "Continue Playing" home-screen row and the
+// per-episode resume indicators on the series/episode-list screen.
+router.get('/progress', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('play_progress')
+    .select('media_item_id, position_seconds, updated_at')
+    .eq('user_id', req.user.sub);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    progress: data.map((r) => ({
+      mediaItemId: r.media_item_id,
+      positionSeconds: r.position_seconds,
+      updatedAt: r.updated_at
+    }))
+  });
+});
+
 router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
   const { data: item } = await supabase.from('media_items').select('*').eq('id', req.params.id).single();
 
