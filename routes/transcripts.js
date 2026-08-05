@@ -8,14 +8,15 @@ const groqAccounts = require('../lib/groqAccountCache');
 
 const router = express.Router();
 
-// Fixed target set: Hindi, English, Marathi, Bengali, and romanized
-// Hindi/"Hinglish" (spoken words phonetically in Latin script, NOT an
-// English translation — see groq.js#buildPrompt). Whichever of these the
-// episode was actually narrated in gets its lines straight from Whisper;
-// the rest are translated/transliterated from that same pass so every
-// language stays lined up against one set of timestamps.
-const LANGUAGES = ['hi', 'en', 'mr', 'bn', 'hi-en'];
-const WHISPER_LANG_TO_CODE = { hindi: 'hi', english: 'en', marathi: 'mr', bengali: 'bn' };
+// Single target now: romanized Hindi/"Hinglish" (spoken words phonetically
+// in Latin script, NOT an English translation — see groq.js#buildHinglishPrompt).
+// This used to also generate Hindi/English/Marathi/Bengali by translating
+// the same Whisper pass into each of them; that was removed, so Hinglish is
+// the only transcript this route produces. Kept as a 1-element array (not a
+// single constant) because everything downstream — status storage, the
+// GET /:mediaItemId response shape, the admin app's per-language rows —
+// is already keyed by language, and this way none of that had to change.
+const LANGUAGES = ['hi-en'];
 
 function loadStorageCreds(account) {
   return JSON.parse(decrypt(account.credentials_enc));
@@ -66,8 +67,8 @@ async function setStatus(mediaItemId, language, fields) {
 }
 
 /* ------------------------------------------------------------------
- * 1) GENERATE  (admin only) — kicks off transcription + translation for
- *    all 5 languages for one episode. Responds immediately and runs the
+ * 1) GENERATE  (admin only) — kicks off transcription + Hinglish
+ *    transliteration for one episode. Responds immediately and runs the
  *    actual work in the background (matches the "don't await, let the
  *    response return immediately" pattern already used for the Drime
  *    live-storage monitor); the admin app polls GET /:mediaItemId for
@@ -119,6 +120,13 @@ async function runGeneration(item) {
   // degraded on Groq's side, etc.) shouldn't sink the whole episode while
   // other keys sit idle — so this also rotates across up to 3 distinct
   // accounts before giving up.
+  //
+  // NOTE: if every account fails identically on the SAME episode (rather
+  // than clearing up on a different key), the cause is almost always the
+  // file itself, not the key — e.g. the unsupported-extension bug fixed in
+  // lib/groq.js (see resolveGroqUpload there). Key rotation can't fix a
+  // file-shaped problem, so a same-error-on-every-account result is the
+  // signal to look at the file/format, not to add more Groq accounts.
   const MAX_ACCOUNT_ATTEMPTS = 3;
   let groqAccount;
   let original;
@@ -160,21 +168,20 @@ async function runGeneration(item) {
     return;
   }
 
-  const sourceCode = WHISPER_LANG_TO_CODE[(original.language || '').toLowerCase()] || null;
-
-  // 3) One language at a time, so a single failure (e.g. one bad LLM batch)
-  // never blocks the others from completing.
+  // 3) Hinglish transliteration of the Whisper pass. (This used to loop
+  // over 5 languages, translating into whichever ones weren't the detected
+  // source; now there's just the one target, and it's always a
+  // transliteration of the original — never a straight passthrough — so
+  // is_source is always false here.)
   for (const lang of LANGUAGES) {
     try {
-      const segments = lang === sourceCode
-        ? original.segments // straight from Whisper, no LLM pass needed
-        : await groq.translateSegments({ apiKey: loadGroqKey(groqAccount), segments: original.segments, targetLanguage: lang });
+      const segments = await groq.transliterateToHinglish({ apiKey: loadGroqKey(groqAccount), segments: original.segments });
 
       const stored = await uploadTranscriptJson({ mediaItem: item, language: lang, segments });
       await setStatus(item.id, lang, {
         status: 'done',
         source_language: original.language || null,
-        is_source: lang === sourceCode,
+        is_source: false,
         segment_count: segments.length,
         storage_account_id: stored.storageAccountId,
         storage_file_id: stored.storageFileId,
