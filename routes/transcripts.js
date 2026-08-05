@@ -111,20 +111,46 @@ async function runGeneration(item) {
   }
 
   // 2) Whisper pass — ONE original-language transcript with line timestamps.
+  //
+  // groq.transcribe() already retries a transient (5xx/network) failure a
+  // few times against the SAME key (see MAX_ATTEMPTS in lib/groq.js). But
+  // when the pool has several admin-added Groq accounts, a key that's
+  // still failing after those retries (rate-limited, flaky, briefly
+  // degraded on Groq's side, etc.) shouldn't sink the whole episode while
+  // other keys sit idle — so this also rotates across up to 3 distinct
+  // accounts before giving up.
+  const MAX_ACCOUNT_ATTEMPTS = 3;
   let groqAccount;
   let original;
-  try {
-    groqAccount = await groqAccounts.pick();
-    original = await groq.transcribe({
-      apiKey: loadGroqKey(groqAccount),
-      buffer: audioBuffer,
-      fileName: item.storage_path,
-      mime: 'audio/mpeg'
-    });
-  } catch (e) {
-    const msg = e.response?.data?.error?.message || e.message;
-    if (e.response?.status === 429 && groqAccount) groqAccounts.markRateLimited(groqAccount.id);
-    if (groqAccount) groqAccounts.markError(groqAccount.id, msg);
+  let lastErr;
+  const triedAccountIds = new Set();
+  for (let i = 0; i < MAX_ACCOUNT_ATTEMPTS; i++) {
+    try {
+      groqAccount = await groqAccounts.pick(); // least-recently-used, cooldown-aware
+      triedAccountIds.add(groqAccount.id);
+
+      original = await groq.transcribe({
+        apiKey: loadGroqKey(groqAccount),
+        buffer: audioBuffer,
+        fileName: item.storage_path
+      });
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      const msg = e.response?.data?.error?.message || e.message;
+      if (e.response?.status === 429 && groqAccount) groqAccounts.markRateLimited(groqAccount.id);
+      if (groqAccount) groqAccounts.markError(groqAccount.id, msg);
+      // Keep trying a different account only for transient-looking
+      // failures; a hard 4xx (e.g. unsupported file) will fail identically
+      // on every key, so there's no point burning the whole pool on it.
+      const status = e.response?.status;
+      const looksAccountSpecific = !status || status === 429 || status >= 500;
+      if (!looksAccountSpecific) break;
+    }
+  }
+  if (lastErr) {
+    const msg = lastErr.response?.data?.error?.message || lastErr.message;
     for (const lang of LANGUAGES) await setStatus(item.id, lang, { status: 'failed', error_message: `Transcription failed: ${msg}` });
     return;
   }
