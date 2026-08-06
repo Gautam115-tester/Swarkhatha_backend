@@ -75,11 +75,30 @@ async function setStatus(mediaItemId, language, fields) {
  *    progress. One episode at a time per call — concurrency isn't needed
  *    at this project's scale, and it keeps Groq rate-limit handling simple.
  * ------------------------------------------------------------------ */
+// A run in 'processing' for longer than this is treated as dead (server
+// restarted mid-run, crashed before reaching a final status, etc.) rather
+// than a real in-flight job -- otherwise one interrupted run could block
+// every future retry on this episode forever.
+const STALE_PROCESSING_MS = Number(process.env.TRANSCRIPT_STALE_PROCESSING_MS || 15 * 60 * 1000);
+
 router.post('/:mediaItemId/generate', requireAuth, requireAdmin, async (req, res) => {
   const { data: item } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
   if (!item) return res.status(404).json({ error: 'Media item not found' });
   if (item.type !== 'audio_story') return res.status(400).json({ error: 'Transcription is only available for audio_story items' });
   if (!item.storage_hash) return res.status(500).json({ error: 'This episode has no storage_hash on file' });
+
+  // Guard against a double-tap, a retried request from a flaky connection,
+  // or an impatient extra click on "Re-generate" while a run is already in
+  // flight -- previously nothing stopped a second full Whisper pass from
+  // starting on the exact same audio, which quietly multiplies the ASPH
+  // usage charged for what looked like one click.
+  const { data: existing } = await supabase.from('transcripts').select('*').eq('media_item_id', item.id).in('language', LANGUAGES);
+  const alreadyRunning = (existing || []).find(
+    (t) => t.status === 'processing' && (Date.now() - new Date(t.updated_at).getTime()) < STALE_PROCESSING_MS
+  );
+  if (alreadyRunning) {
+    return res.status(409).json({ error: 'A transcription run is already in progress for this episode — wait for it to finish before starting another.' });
+  }
 
   for (const lang of LANGUAGES) {
     await setStatus(item.id, lang, { status: 'processing', error_message: null });
@@ -127,7 +146,18 @@ async function runGeneration(item) {
   // lib/groq.js (see resolveGroqUpload there). Key rotation can't fix a
   // file-shaped problem, so a same-error-on-every-account result is the
   // signal to look at the file/format, not to add more Groq accounts.
-  const MAX_ACCOUNT_ATTEMPTS = 3;
+  //
+  // Was a flat 3 — but that meant a pool bigger than 3 (e.g. 6 admin-added
+  // accounts, added specifically to spread Groq's per-account ASPH rate
+  // limit across more org quotas) still only got 3 shots per generation
+  // call, leaving the rest of the pool untried on a bad run. Defaults to
+  // the size of the active pool now (capped at 8 so one call can't loop
+  // forever if someone pools a huge number of keys); override via
+  // GROQ_MAX_ACCOUNT_ATTEMPTS if needed.
+  const activeGroqAccounts = await groqAccounts.listActive();
+  const MAX_ACCOUNT_ATTEMPTS = Number(
+    process.env.GROQ_MAX_ACCOUNT_ATTEMPTS || Math.min(Math.max(activeGroqAccounts.length, 1), 8)
+  );
   let groqAccount;
   let original;
   let lastErr;
@@ -147,7 +177,11 @@ async function runGeneration(item) {
     } catch (e) {
       lastErr = e;
       const msg = groq.extractErrorMessage(e);
-      if (e.response?.status === 429 && groqAccount) groqAccounts.markRateLimited(groqAccount.id);
+      // For a 429, cool this account down for however long Groq itself
+      // says it needs (parsed from the error body -- often minutes for an
+      // ASPH-style limit) rather than a flat default, so pick() doesn't
+      // hand it straight back out before its quota window has cleared.
+      if (e.response?.status === 429 && groqAccount) groqAccounts.markRateLimited(groqAccount.id, groq.parseRetryAfterMs(msg));
       if (groqAccount) groqAccounts.markError(groqAccount.id, msg);
       // Keep trying a different account only for transient-looking
       // failures; a hard 4xx (e.g. unsupported file) will fail identically
@@ -192,7 +226,7 @@ async function runGeneration(item) {
       });
     } catch (e) {
       const msg = groq.extractErrorMessage(e);
-      if (e.response?.status === 429) groqAccounts.markRateLimited(groqAccount.id);
+      if (e.response?.status === 429) groqAccounts.markRateLimited(groqAccount.id, groq.parseRetryAfterMs(msg));
       await setStatus(item.id, lang, { status: 'failed', error_message: msg });
     }
   }
