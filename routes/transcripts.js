@@ -81,6 +81,15 @@ async function setStatus(mediaItemId, language, fields) {
 // every future retry on this episode forever.
 const STALE_PROCESSING_MS = Number(process.env.TRANSCRIPT_STALE_PROCESSING_MS || 15 * 60 * 1000);
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Cap on how long a single generation run will wait out a pool-wide Groq
+// 429 (see the wait-on-exhaustion comments below) before giving up. Kept
+// comfortably under STALE_PROCESSING_MS so a run that's genuinely waiting
+// on quota doesn't get mistaken for a dead/crashed one by the
+// already-running check above.
+const MAX_POOL_WAIT_MS = Number(process.env.GROQ_MAX_POOL_WAIT_MS || 10 * 60 * 1000);
+
 router.post('/:mediaItemId/generate', requireAuth, requireAdmin, async (req, res) => {
   const { data: item } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
   if (!item) return res.status(404).json({ error: 'Media item not found' });
@@ -155,8 +164,12 @@ async function runGeneration(item) {
   // forever if someone pools a huge number of keys); override via
   // GROQ_MAX_ACCOUNT_ATTEMPTS if needed.
   const activeGroqAccounts = await groqAccounts.listActive();
+  // "+2" over the raw pool size leaves room for at least one wait-then-retry
+  // cycle below even when the pool is tiny (e.g. exactly 1 account) --
+  // without it, a pool of 1 got exactly 1 attempt total and could never
+  // benefit from the wait-on-exhaustion logic at all.
   const MAX_ACCOUNT_ATTEMPTS = Number(
-    process.env.GROQ_MAX_ACCOUNT_ATTEMPTS || Math.min(Math.max(activeGroqAccounts.length, 1), 8)
+    process.env.GROQ_MAX_ACCOUNT_ATTEMPTS || Math.min(Math.max(activeGroqAccounts.length, 1) + 2, 10)
   );
   let groqAccount;
   let original;
@@ -181,7 +194,18 @@ async function runGeneration(item) {
       // says it needs (parsed from the error body -- often minutes for an
       // ASPH-style limit) rather than a flat default, so pick() doesn't
       // hand it straight back out before its quota window has cleared.
-      if (e.response?.status === 429 && groqAccount) groqAccounts.markRateLimited(groqAccount.id, groq.parseRetryAfterMs(msg));
+      if (e.response?.status === 429 && groqAccount) {
+        groqAccounts.markRateLimited(groqAccount.id, groq.parseRetryAfterMs(msg));
+        // If that just put EVERY active account into cooldown (a small
+        // pool, or several keys sharing one Groq org's ASPH quota), the
+        // next attempt would just immediately hit the same 429 again.
+        // Groq's error body already tells us exactly how long the quota
+        // needs, so wait that out (capped) instead of burning through the
+        // rest of the attempts on a pool that has no chance of succeeding
+        // yet.
+        const waitMs = await groqAccounts.msUntilAvailable();
+        if (waitMs > 0) await sleep(Math.min(waitMs, MAX_POOL_WAIT_MS));
+      }
       if (groqAccount) groqAccounts.markError(groqAccount.id, msg);
       // Keep trying a different account only for transient-looking
       // failures; a hard 4xx (e.g. unsupported file) will fail identically
@@ -208,8 +232,38 @@ async function runGeneration(item) {
   // transliteration of the original — never a straight passthrough — so
   // is_source is always false here.)
   for (const lang of LANGUAGES) {
+    // Tracks whichever account transliterateToHinglish() actually ends up
+    // using -- it may rotate away from groqAccount (the Whisper-step
+    // account) via getApiKey() below, so this starts as a reasonable
+    // default and is reassigned every time getApiKey() is called.
+    let hinglishAccount = groqAccount;
     try {
-      const segments = await groq.transliterateToHinglish({ apiKey: loadGroqKey(groqAccount), segments: original.segments });
+      const segments = await groq.transliterateToHinglish({
+        // groq.js's transliterateToHinglish/transliterateBatchWithRetry
+        // rotate across the account pool on a 429 by calling this for the
+        // next account to try -- it must be a function returning
+        // {account, apiKey}, NOT a bare apiKey string. Passing a bare
+        // apiKey here (as this used to) is exactly what produced the
+        // "getApiKey is not a function" crash: transliterateBatchWithRetry
+        // calls `await getApiKey()`, and calling a string is a TypeError.
+        getApiKey: async () => {
+          hinglishAccount = await groqAccounts.pick();
+          return { account: hinglishAccount, apiKey: loadGroqKey(hinglishAccount) };
+        },
+        // Same wait-on-exhaustion idea as the Whisper step above: if a
+        // 429 just put every account in the pool into cooldown, wait for
+        // the soonest one to clear (capped) before the retry loop's next
+        // attempt, instead of immediately re-hitting the same 429.
+        onRateLimited: async (account, e2) => {
+          const rlMsg = groq.extractErrorMessage(e2);
+          groqAccounts.markRateLimited(account.id, groq.parseRetryAfterMs(rlMsg));
+          groqAccounts.markError(account.id, rlMsg);
+          const waitMs = await groqAccounts.msUntilAvailable();
+          if (waitMs > 0) await sleep(Math.min(waitMs, MAX_POOL_WAIT_MS));
+        },
+        segments: original.segments,
+        accountAttempts: MAX_ACCOUNT_ATTEMPTS
+      });
 
       const stored = await uploadTranscriptJson({ mediaItem: item, language: lang, segments });
       await setStatus(item.id, lang, {
@@ -221,12 +275,12 @@ async function runGeneration(item) {
         storage_file_id: stored.storageFileId,
         storage_hash: stored.storageHash,
         storage_path: stored.storagePath,
-        generated_by_account_id: groqAccount.id,
+        generated_by_account_id: hinglishAccount.id,
         error_message: null
       });
     } catch (e) {
       const msg = groq.extractErrorMessage(e);
-      if (e.response?.status === 429) groqAccounts.markRateLimited(groqAccount.id, groq.parseRetryAfterMs(msg));
+      if (e.response?.status === 429 && hinglishAccount) groqAccounts.markRateLimited(hinglishAccount.id, groq.parseRetryAfterMs(msg));
       await setStatus(item.id, lang, { status: 'failed', error_message: msg });
     }
   }
