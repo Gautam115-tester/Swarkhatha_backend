@@ -146,7 +146,7 @@ async function runGeneration(item) {
       break;
     } catch (e) {
       lastErr = e;
-      const msg = e.response?.data?.error?.message || e.message;
+      const msg = groq.extractErrorMessage(e);
       if (e.response?.status === 429 && groqAccount) groqAccounts.markRateLimited(groqAccount.id);
       if (groqAccount) groqAccounts.markError(groqAccount.id, msg);
       // Keep trying a different account only for transient-looking
@@ -158,7 +158,7 @@ async function runGeneration(item) {
     }
   }
   if (lastErr) {
-    const msg = lastErr.response?.data?.error?.message || lastErr.message;
+    const msg = groq.extractErrorMessage(lastErr);
     for (const lang of LANGUAGES) await setStatus(item.id, lang, { status: 'failed', error_message: `Transcription failed: ${msg}` });
     return;
   }
@@ -191,7 +191,7 @@ async function runGeneration(item) {
         error_message: null
       });
     } catch (e) {
-      const msg = e.response?.data?.error?.message || e.message;
+      const msg = groq.extractErrorMessage(e);
       if (e.response?.status === 429) groqAccounts.markRateLimited(groqAccount.id);
       await setStatus(item.id, lang, { status: 'failed', error_message: msg });
     }
