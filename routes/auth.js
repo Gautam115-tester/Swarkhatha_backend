@@ -9,43 +9,59 @@ const router = express.Router();
 // New accounts start out 'pending' — they cannot log in until an admin approves them
 // from the admin app (see routes/users.js), so no token is issued here.
 router.post('/signup', async (req, res) => {
-  const { email, password, displayName } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+  try {
+    const { email, password, displayName } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
-  const { data: existing } = await supabase.from('app_users').select('id').eq('email', email).maybeSingle();
-  if (existing) return res.status(409).json({ error: 'Email already registered' });
+    const { data: existing, error: lookupError } = await supabase
+      .from('app_users').select('id').eq('email', email).maybeSingle();
+    if (lookupError) return res.status(500).json({ error: lookupError.message });
+    if (existing) return res.status(409).json({ error: 'Email already registered' });
 
-  const password_hash = await bcrypt.hash(password, 10);
-  const { data, error } = await supabase
-    .from('app_users')
-    .insert({ email, password_hash, display_name: displayName, role: 'listener', status: 'pending' })
-    .select()
-    .single();
+    const password_hash = await bcrypt.hash(password, 10);
+    const { data, error } = await supabase
+      .from('app_users')
+      .insert({ email, password_hash, display_name: displayName, role: 'listener', status: 'pending' })
+      .select()
+      .single();
 
-  if (error) return res.status(500).json({ error: error.message });
+    if (error) return res.status(500).json({ error: error.message });
 
-  // No token: the listener app must not treat this as a logged-in session
-  // until an admin approves the account.
-  res.status(201).json({ pending: true, user: publicUser(data) });
+    // No token: the listener app must not treat this as a logged-in session
+    // until an admin approves the account.
+    res.status(201).json({ pending: true, user: publicUser(data) });
+  } catch (err) {
+    console.error('signup error:', err);
+    res.status(500).json({ error: 'Signup failed. Please try again.' });
+  }
 });
 
 router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
-  const { data: user } = await supabase.from('app_users').select('*').eq('email', email).maybeSingle();
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
-  const ok = await bcrypt.compare(password, user.password_hash);
-  if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const { data: user, error: lookupError } = await supabase
+      .from('app_users').select('*').eq('email', email).maybeSingle();
+    if (lookupError) return res.status(500).json({ error: lookupError.message });
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
-  if (user.status === 'pending') {
-    return res.status(403).json({ error: 'Your account is awaiting admin approval.', status: 'pending' });
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+
+    if (user.status === 'pending') {
+      return res.status(403).json({ error: 'Your account is awaiting admin approval.', status: 'pending' });
+    }
+    if (user.status === 'rejected') {
+      return res.status(403).json({ error: 'Your signup request was not approved.', status: 'rejected' });
+    }
+
+    const token = issueToken(user);
+    res.json({ token, user: publicUser(user) });
+  } catch (err) {
+    console.error('login error:', err);
+    res.status(500).json({ error: 'Login failed. Please try again.' });
   }
-  if (user.status === 'rejected') {
-    return res.status(403).json({ error: 'Your signup request was not approved.', status: 'rejected' });
-  }
-
-  const token = issueToken(user);
-  res.json({ token, user: publicUser(user) });
 });
 
 function issueToken(user) {

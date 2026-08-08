@@ -24,6 +24,33 @@ app.use('/api/users', usersRoutes);
 app.use('/api/ai-accounts', aiAccountsRoutes);
 app.use('/api/transcripts', transcriptsRoutes);
 
+// --- JSON 404 handler ---------------------------------------------------
+// Any request that doesn't match a route above used to fall through to
+// Express's default HTML 404 page (starts with "<!DOCTYPE html>"), which
+// broke jsonDecode() on the Flutter side (FormatException at character 1).
+// Every unmatched route now gets a proper JSON body instead.
+app.use((req, res) => {
+  res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` });
+});
+
+// --- JSON error handler ---------------------------------------------------
+// Catches: malformed JSON in the request body (express.json() throws a
+// SyntaxError), and any error passed via next(err) or thrown synchronously
+// in a route. Without this, Express's default handler renders an HTML
+// error page for these too — same "<!DOCTYPE html>" symptom as the 404
+// above, just triggered by a bad/broken request instead of a wrong URL.
+// This must be defined last, after all routes, with all 4 params.
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+
+  if (err.type === 'entity.parse.failed' || err instanceof SyntaxError) {
+    return res.status(400).json({ error: 'Malformed JSON in request body' });
+  }
+
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({ error: err.message || 'Internal server error' });
+});
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`SwarKatha backend running on port ${PORT}`);
