@@ -1,4 +1,5 @@
 const express = require('express');
+const axios = require('axios');
 const supabase = require('../lib/supabaseClient');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { decrypt } = require('../lib/crypto');
@@ -527,6 +528,27 @@ router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
   const { error } = await supabase.from('media_items').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   mediaItemCache.invalidate(req.params.id); // don't let a deleted item keep resolving from cache — see lib/mediaItemCache.js
+
+  // Best-effort: evict this item's edge-cached audio bytes so it stops
+  // being servable from a warm Cloudflare cache immediately, rather than
+  // waiting for CACHE_MAX_AGE_SECONDS. This only reaches whichever
+  // Cloudflare data center handles this one request, not every colo —
+  // it's a nice-to-have, not the actual safety net. The real bound on
+  // how long deleted content can still be heard is the media token's
+  // own short TTL (see signMediaToken in middleware/auth.js): once the
+  // row above is gone, resolve-media 404s on any cache miss, and no new
+  // token can ever be minted for this id again — so worst case exposure
+  // is whatever time was left on an already-issued token, not days.
+  if (process.env.AUDIO_CDN_BASE_URL && process.env.WORKER_INTERNAL_SECRET) {
+    axios.post(
+      `${process.env.AUDIO_CDN_BASE_URL.replace(/\/$/, '')}/internal/purge/${req.params.id}`,
+      null,
+      { headers: { 'X-Internal-Secret': process.env.WORKER_INTERNAL_SECRET }, timeout: 5000 }
+    ).catch((e) => {
+      console.error('[media delete] failed to purge edge cache (continuing):', e.response?.data || e.message);
+    });
+  }
+
   res.json({ ok: true });
 });
 

@@ -11,6 +11,11 @@ const aiAccountsRoutes = require('./routes/aiAccounts');
 const transcriptsRoutes = require('./routes/transcripts');
 
 const app = express();
+// Render sits behind its own reverse proxy — without this, every request
+// looks like it comes from the same internal IP to Express (and to
+// express-rate-limit in middleware/rateLimit.js), which would make
+// per-IP rate limiting either useless or wrongly punish everyone at once.
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 

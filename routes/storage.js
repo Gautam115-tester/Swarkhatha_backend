@@ -9,6 +9,7 @@ const coverImageStorage = require('../lib/coverImageStorage');
 const coverImageCache = require('../lib/coverImageCache');
 const accountCache = require('../lib/accountCache');
 const mediaItemCache = require('../lib/mediaItemCache');
+const { mediaLimiter } = require('../middleware/rateLimit');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } }); // 1GB cap
@@ -529,7 +530,7 @@ router.get('/media-item-cache-stats', requireAuth, requireAdmin, (req, res) => {
  *    returns a URL back into THIS backend's own /stream/:id proxy,
  *    which fetches from Drime server-side and pipes the bytes through.
  * ------------------------------------------------------------------ */
-router.get('/stream-url/:mediaItemId', requireAuth, async (req, res) => {
+router.get('/stream-url/:mediaItemId', mediaLimiter, requireAuth, async (req, res) => {
   const item = await mediaItemCache.getOrFetch(req.params.mediaItemId, async () => {
     const { data } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
     return data || null;
@@ -551,7 +552,7 @@ router.get('/stream-url/:mediaItemId', requireAuth, async (req, res) => {
  *    at /file/:id (which additionally sets a Content-Disposition:
  *    attachment header so it saves rather than plays inline).
  * ------------------------------------------------------------------ */
-router.get('/download-url/:mediaItemId', requireAuth, async (req, res) => {
+router.get('/download-url/:mediaItemId', mediaLimiter, requireAuth, async (req, res) => {
   const item = await mediaItemCache.getOrFetch(req.params.mediaItemId, async () => {
     const { data } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
     return data || null;
@@ -585,7 +586,7 @@ async function proxyMedia(req, res, { forceDownload }) {
   if (!item) return res.status(404).json({ error: 'Not found' });
   if (!item.storage_hash) return res.status(500).json({ error: 'This item has no storage_hash on file' });
 
-  const { data: account } = await supabase.from('storage_accounts').select('*').eq('id', item.storage_account_id).single();
+  const account = await accountCache.getAccount(item.storage_account_id);
   if (!account) return res.status(404).json({ error: 'Storage account not found' });
 
   try {
@@ -625,8 +626,8 @@ async function proxyMedia(req, res, { forceDownload }) {
   }
 }
 
-router.get('/stream/:mediaItemId', requireMediaAccess('stream'), (req, res) => proxyMedia(req, res, { forceDownload: false }));
-router.get('/file/:mediaItemId', requireMediaAccess('download'), (req, res) => proxyMedia(req, res, { forceDownload: true }));
+router.get('/stream/:mediaItemId', mediaLimiter, requireMediaAccess('stream'), (req, res) => proxyMedia(req, res, { forceDownload: false }));
+router.get('/file/:mediaItemId', mediaLimiter, requireMediaAccess('download'), (req, res) => proxyMedia(req, res, { forceDownload: true }));
 
 /* ------------------------------------------------------------------
  * 7) RESOLVE MEDIA  (internal only — the Cloudflare audio Worker, not
@@ -661,7 +662,7 @@ router.get('/resolve-media/:mediaItemId', async (req, res) => {
     if (!item) return res.status(404).json({ error: 'Not found' });
     if (!item.storage_hash) return res.status(500).json({ error: 'This item has no storage_hash on file' });
 
-    const { data: account } = await supabase.from('storage_accounts').select('*').eq('id', item.storage_account_id).single();
+    const account = await accountCache.getAccount(item.storage_account_id);
     if (!account) return res.status(404).json({ error: 'Storage account not found' });
 
     const creds = loadCreds(account);

@@ -2,13 +2,14 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const supabase = require('../lib/supabaseClient');
+const { authLimiter } = require('../middleware/rateLimit');
 
 const router = express.Router();
 
 // Listener signup (admins are created manually in Supabase or via a one-time seed script).
 // New accounts start out 'pending' — they cannot log in until an admin approves them
 // from the admin app (see routes/users.js), so no token is issued here.
-router.post('/signup', async (req, res) => {
+router.post('/signup', authLimiter, async (req, res) => {
   try {
     const { email, password, displayName } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
@@ -36,7 +37,7 @@ router.post('/signup', async (req, res) => {
   }
 });
 
-router.post('/login', async (req, res) => {
+router.post('/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
