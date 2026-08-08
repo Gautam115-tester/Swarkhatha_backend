@@ -25,6 +25,26 @@ function loadCreds(account) {
   return JSON.parse(decrypt(account.credentials_enc));
 }
 
+// Shared by the old POST /upload and the new /upload-init below — picks
+// the account the admin specified (validating its purpose matches), or
+// auto-picks whichever matching account has the most free space.
+async function pickAccountFor(mediaType, accountId) {
+  if (accountId) {
+    const { data: account } = await supabase.from('storage_accounts').select('*').eq('id', accountId).single();
+    if (!account) throw Object.assign(new Error('Account not found'), { status: 404 });
+    if (account.purpose !== 'both' && account.purpose !== mediaType) {
+      throw Object.assign(new Error(`This account is dedicated to '${account.purpose}', not '${mediaType}'.`), { status: 400 });
+    }
+    return account;
+  }
+  const { data: accounts } = await supabase
+    .from('storage_accounts').select('*').eq('is_active', true).in('purpose', [mediaType, 'both']);
+  if (!accounts || accounts.length === 0) {
+    throw Object.assign(new Error(`No matching '${mediaType}' (or 'both') Drime storage account found`), { status: 507 });
+  }
+  return accounts.sort((a, b) => (b.last_known_free_bytes ?? 0) - (a.last_known_free_bytes ?? 0))[0];
+}
+
 function baseUrl(req) {
   return process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
 }
@@ -246,6 +266,125 @@ router.post('/upload', requireAuth, requireAdmin, upload.single('file'), async (
     });
   } catch (e) {
     res.status(500).json({ error: 'Upload failed: ' + (e.response?.data?.message || e.message) });
+  }
+});
+
+/* ------------------------------------------------------------------
+ * 3a-i) UPLOAD-INIT / 3a-ii) UPLOAD-COMPLETE  (admin only)
+ *
+ *    Direct-from-device counterpart to POST /upload above. The old
+ *    route pulls the whole file into this server's memory (multer)
+ *    then re-uploads it to Drime — which means every music/audio_story
+ *    upload burns Render bandwidth TWICE (once receiving it from the
+ *    admin app, once sending it back out to Drime). Since Drime's own
+ *    upload flow is already presigned-URL based under the hood (see
+ *    lib/drime.js), this hands those signed URL(s) straight to the
+ *    admin app instead, so the actual bytes go admin device -> Drime
+ *    directly. This backend only ever sees small JSON: which account
+ *    to use, the presigned URL(s), and afterward the final metadata to
+ *    register. POST /upload above is left in place, unused by the
+ *    current admin app, as a fallback.
+ *
+ *    Flow:
+ *      1. POST /upload-init   { fileName, mime, sizeBytes, mediaType, accountId? }
+ *         -> { mode: 'simple', accountId, accountLabel, uploadUrl, key }
+ *         or { mode: 'multipart', accountId, accountLabel, uploadId, key,
+ *              chunkBytes, parts: [{ partNumber, url }] }
+ *      2. Admin app PUTs the file bytes straight to uploadUrl (simple)
+ *         or PUTs each chunk to its part url and keeps the ETag headers
+ *         (multipart) — none of this touches this backend.
+ *      3. POST /upload-complete  { accountId, mediaType, mode, key,
+ *              fileName, mime, sizeBytes, uploadId?, parts? }
+ *         -> same response shape POST /upload always returned:
+ *            { accountId, accountLabel, provider, storageFileId,
+ *              storageHash, storagePath, sizeBytes }
+ * ------------------------------------------------------------------ */
+router.post('/upload-init', requireAuth, requireAdmin, async (req, res) => {
+  const { fileName, mime, sizeBytes, mediaType, accountId } = req.body;
+  if (!fileName || !sizeBytes) return res.status(400).json({ error: 'fileName and sizeBytes are required' });
+  if (!mediaType || !['music', 'audio_story'].includes(mediaType)) {
+    return res.status(400).json({ error: "mediaType is required and must be 'music' or 'audio_story'" });
+  }
+
+  let account;
+  try {
+    account = await pickAccountFor(mediaType, accountId);
+  } catch (e) {
+    return res.status(e.status || 500).json({ error: e.message });
+  }
+
+  const creds = loadCreds(account);
+  const size = Number(sizeBytes);
+
+  try {
+    if (size < drime.SIMPLE_UPLOAD_MAX_BYTES) {
+      const { url, key } = await drime.presignSimpleUpload({
+        accessToken: creds.accessToken, fileName, mime, size, workspaceId: creds.workspaceId
+      });
+      return res.json({ mode: 'simple', accountId: account.id, accountLabel: account.label, uploadUrl: url, key });
+    }
+
+    const { uploadId, key } = await drime.createMultipartUpload({
+      accessToken: creds.accessToken, fileName, mime, size, workspaceId: creds.workspaceId, folderId: creds.folderId
+    });
+    const chunkBytes = drime.MULTIPART_CHUNK_BYTES;
+    const totalParts = Math.max(1, Math.ceil(size / chunkBytes));
+    const partNumbers = Array.from({ length: totalParts }, (_, i) => i + 1);
+    const urls = await drime.batchSignPartUrls({ accessToken: creds.accessToken, uploadId, key, partNumbers });
+
+    return res.json({
+      mode: 'multipart', accountId: account.id, accountLabel: account.label,
+      uploadId, key, chunkBytes, parts: urls
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not start upload: ' + (e.response?.data?.message || e.message) });
+  }
+});
+
+router.post('/upload-complete', requireAuth, requireAdmin, async (req, res) => {
+  const { accountId, mediaType, mode, key, fileName, mime, sizeBytes, uploadId, parts } = req.body;
+  if (!accountId || !key || !fileName || !sizeBytes || !mode) {
+    return res.status(400).json({ error: 'accountId, mode, key, fileName, and sizeBytes are required' });
+  }
+
+  const { data: account } = await supabase.from('storage_accounts').select('*').eq('id', accountId).single();
+  if (!account) return res.status(404).json({ error: 'Account not found' });
+  if (mediaType && account.purpose !== 'both' && account.purpose !== mediaType) {
+    return res.status(400).json({ error: `This account is dedicated to '${account.purpose}', not '${mediaType}'.` });
+  }
+
+  const creds = loadCreds(account);
+  const size = Number(sizeBytes);
+
+  try {
+    if (mode === 'multipart') {
+      if (!uploadId || !Array.isArray(parts) || parts.length === 0) {
+        return res.status(400).json({ error: 'uploadId and parts are required to complete a multipart upload' });
+      }
+      try {
+        await drime.completeMultipartUpload({ accessToken: creds.accessToken, uploadId, key, parts });
+      } catch (e) {
+        await drime.abortMultipartUpload({ accessToken: creds.accessToken, uploadId, key });
+        throw e;
+      }
+    }
+
+    const fileEntry = await drime.registerEntry({
+      accessToken: creds.accessToken, key, size, fileName, mime,
+      workspaceId: creds.workspaceId, folderId: creds.folderId
+    });
+
+    return res.json({
+      accountId: account.id,
+      accountLabel: account.label,
+      provider: 'drime',
+      storageFileId: String(fileEntry.id),
+      storageHash: fileEntry.hash,
+      storagePath: fileEntry.name || fileEntry.file_name || fileName,
+      sizeBytes: Number(fileEntry.file_size || size)
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Upload failed to finalize: ' + (e.response?.data?.message || e.message) });
   }
 });
 
