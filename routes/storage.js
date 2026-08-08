@@ -43,6 +43,21 @@ function coverBaseUrl(req) {
   return process.env.IMAGE_CDN_BASE_URL || baseUrl(req);
 }
 
+// Audio is the bandwidth-heavy counterpart to cover images above — every
+// stream, seek, and download used to pipe full audio bytes through this
+// Render instance, which is what burns through Render's bandwidth
+// allowance. When AUDIO_CDN_BASE_URL is set (pointed at the Cloudflare
+// Worker in /cdn-worker, once it's been extended to handle
+// /api/storage/stream and /api/storage/file too), newly-minted
+// stream-url/download-url responses point there instead, and the Worker
+// fetches straight from Drime — this backend's egress meter barely
+// moves. The underlying GET /stream/:id and /file/:id routes below still
+// work standalone either way, so this is purely additive: nothing breaks
+// if it's left unset, it just keeps proxying through Render as before.
+function audioBaseUrl(req) {
+  return process.env.AUDIO_CDN_BASE_URL || baseUrl(req);
+}
+
 /* ------------------------------------------------------------------
  * 1) ADD A STORAGE ACCOUNT  (admin only)
  *    Body: { accessToken, workspaceId, folderId, purpose, label }
@@ -385,7 +400,7 @@ router.get('/stream-url/:mediaItemId', requireAuth, async (req, res) => {
 
   const token = signMediaToken(item.id, 'stream', STREAM_TOKEN_TTL_SECONDS);
   return res.json({
-    url: `${baseUrl(req)}/api/storage/stream/${item.id}?token=${token}`,
+    url: `${audioBaseUrl(req)}/api/storage/stream/${item.id}?token=${token}`,
     expiresInSeconds: STREAM_TOKEN_TTL_SECONDS,
     provider: 'drime'
   });
@@ -407,7 +422,7 @@ router.get('/download-url/:mediaItemId', requireAuth, async (req, res) => {
 
   const token = signMediaToken(item.id, 'download', STREAM_TOKEN_TTL_SECONDS);
   return res.json({
-    url: `${baseUrl(req)}/api/storage/file/${item.id}?token=${token}`,
+    url: `${audioBaseUrl(req)}/api/storage/file/${item.id}?token=${token}`,
     fileName: item.storage_path,
     expiresInSeconds: STREAM_TOKEN_TTL_SECONDS,
     provider: 'drime'
@@ -473,5 +488,54 @@ async function proxyMedia(req, res, { forceDownload }) {
 
 router.get('/stream/:mediaItemId', requireMediaAccess('stream'), (req, res) => proxyMedia(req, res, { forceDownload: false }));
 router.get('/file/:mediaItemId', requireMediaAccess('download'), (req, res) => proxyMedia(req, res, { forceDownload: true }));
+
+/* ------------------------------------------------------------------
+ * 7) RESOLVE MEDIA  (internal only — the Cloudflare audio Worker, not
+ *    the Flutter app) — replaces proxyMedia() above as the audio path
+ *    once AUDIO_CDN_BASE_URL is set. Instead of piping the file itself,
+ *    this decrypts the item's storage-account credentials (same lookup
+ *    proxyMedia does) and hands back tiny JSON: the Drime access token,
+ *    the file hash, and Drime's API base. The Worker then fetches the
+ *    actual bytes straight from Drime and streams them to the listener
+ *    — this response is a few hundred bytes regardless of file size, so
+ *    it barely registers against Render's bandwidth cap even at high
+ *    stream volume.
+ *
+ *    Gated by a shared secret (WORKER_INTERNAL_SECRET) known only to
+ *    the Worker — never by a listener JWT or the short-lived
+ *    signMediaToken() from stream-url/download-url above, both of which
+ *    the Worker verifies itself before ever calling this. If this
+ *    secret is unset, the endpoint refuses every request rather than
+ *    silently handing out Drime credentials to whoever asks.
+ * ------------------------------------------------------------------ */
+router.get('/resolve-media/:mediaItemId', async (req, res) => {
+  const secret = process.env.WORKER_INTERNAL_SECRET;
+  if (!secret || req.headers['x-internal-secret'] !== secret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const item = await mediaItemCache.getOrFetch(req.params.mediaItemId, async () => {
+      const { data } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
+      return data || null;
+    });
+    if (!item) return res.status(404).json({ error: 'Not found' });
+    if (!item.storage_hash) return res.status(500).json({ error: 'This item has no storage_hash on file' });
+
+    const { data: account } = await supabase.from('storage_accounts').select('*').eq('id', item.storage_account_id).single();
+    if (!account) return res.status(404).json({ error: 'Storage account not found' });
+
+    const creds = loadCreds(account);
+    res.json({
+      accessToken: creds.accessToken,
+      hash: item.storage_hash,
+      fileName: (item.storage_path || item.title || 'download'),
+      drimeApiBase: process.env.DRIME_API_BASE || 'https://app.drime.cloud/api/v1'
+    });
+  } catch (e) {
+    console.error('resolve-media error:', e);
+    res.status(503).json({ error: 'Failed to resolve media: ' + (e.response?.data?.message || e.message) });
+  }
+});
 
 module.exports = router;
