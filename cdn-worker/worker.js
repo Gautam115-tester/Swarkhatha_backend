@@ -44,7 +44,7 @@
 // all, on the free plan or any paid plan, ever. If you outgrow 100k/day,
 // the Workers Paid plan is $5/mo flat for 10M requests/month.
 
-const ORIGIN = 'https://your-backend.onrender.com'; // <-- set this to your real Render URL
+const ORIGIN = 'https://swarkhatha-7nk1.onrender.com'; // <-- set this to your real Render URL
 
 export default {
   async fetch(request, env, ctx) {
