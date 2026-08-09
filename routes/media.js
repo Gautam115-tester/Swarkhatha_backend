@@ -401,6 +401,78 @@ router.get('/stories/:id/episodes', requireAuth, async (req, res) => {
   });
 });
 
+// Admin: manually set/replace a story series' cover image, without
+// needing to upload a whole new episode to trigger the cover-replace
+// path in findOrCreateStorySeries above. Needed because a series' Drime
+// cover file can go missing on its own (deleted by hand directly on
+// Drime, as opposed to being replaced through this app) — this lets the
+// admin re-upload just the image and point the series at it.
+// Body: { coverImageUrl, coverStorageAccountId, coverStorageFileId,
+// coverStorageHash } — get these from POST /api/storage/upload-image
+// first (same upload-then-register two-step every other cover already
+// uses; see lib/coverImageStorage.js).
+router.patch('/stories/:id/cover', requireAuth, requireAdmin, async (req, res) => {
+  const { coverImageUrl, coverStorageAccountId, coverStorageFileId, coverStorageHash } = req.body;
+  if (!coverImageUrl) {
+    return res.status(400).json({ error: 'coverImageUrl is required — upload the image via POST /api/storage/upload-image first' });
+  }
+
+  const { data: series, error: seriesErr } = await supabase
+    .from('story_series').select('*').eq('id', req.params.id).maybeSingle();
+  if (seriesErr) return res.status(500).json({ error: seriesErr.message });
+  if (!series) return res.status(404).json({ error: 'Story series not found' });
+
+  const oldAccountId = series.image_storage_account_id;
+  const oldStorageFileId = series.image_storage_file_id;
+
+  const { data: updated, error: updErr } = await supabase
+    .from('story_series')
+    .update({
+      cover_image_url: coverImageUrl,
+      image_storage_account_id: coverStorageAccountId || null,
+      image_storage_file_id: coverStorageFileId || null,
+      image_storage_hash: coverStorageHash || null
+    })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+  if (updErr) return res.status(500).json({ error: updErr.message });
+
+  // Propagate to every existing episode of this series, same as the
+  // upload-time cover-replace path in findOrCreateStorySeries above —
+  // a manual re-cover should take effect everywhere immediately, not
+  // just for episodes uploaded from now on.
+  const { data: propagated, error: propErr } = await supabase
+    .from('media_items')
+    .update({ cover_image_url: coverImageUrl })
+    .eq('story_series_id', req.params.id)
+    .select('id');
+  if (propErr) console.error('[stories/:id/cover] episode propagation failed (continuing):', propErr.message);
+  else if (propagated) propagated.forEach((row) => mediaItemCache.invalidate(row.id));
+
+  // Best-effort cleanup of whatever file this cover used to point at.
+  // Both an old row predating these columns (oldStorageFileId null) and
+  // the exact scenario this endpoint exists for (the old Drime file was
+  // already deleted by hand, so this delete just 404s upstream) are
+  // expected, non-fatal outcomes here — the new cover is already live
+  // and correct on the row above either way.
+  if (oldAccountId && oldStorageFileId) {
+    coverImageStorage
+      .deleteImage({ accountId: oldAccountId, storageFileId: oldStorageFileId })
+      .catch((e) => console.error('[stories/:id/cover] failed to delete old cover (continuing):', e.response?.data?.message || e.message));
+  }
+
+  res.json({
+    series: {
+      id: updated.id,
+      storyTitle: updated.title,
+      narrator: updated.narrator,
+      coverImageUrl: updated.cover_image_url,
+      episodeCount: updated.episode_count
+    }
+  });
+});
+
 // Same "is this episode still worth resuming" threshold AppState uses on
 // the Flutter client (see AppState._resumableCeiling) -- kept in sync by
 // hand since there's no shared config between the two codebases. An
