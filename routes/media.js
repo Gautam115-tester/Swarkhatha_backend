@@ -4,6 +4,7 @@ const supabase = require('../lib/supabaseClient');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { decrypt } = require('../lib/crypto');
 const drime = require('../lib/drime');
+const coverImageStorage = require('../lib/coverImageStorage');
 const mediaItemCache = require('../lib/mediaItemCache');
 
 const router = express.Router();
@@ -94,7 +95,7 @@ function composeEpisodeTitle(storyTitle, epNumber, epTitle) {
 // (name, artist) so re-uploading tracks from the same album reuses
 // the same album_id instead of creating a duplicate; track_count is
 // incremented server-side so it never drifts from actual inserts.
-async function findOrCreateAlbum({ name, artist, coverImageUrl }) {
+async function findOrCreateAlbum({ name, artist, coverImageUrl, coverStorageAccountId, coverStorageFileId, coverStorageHash }) {
   const albumName = sanitizeSegment(name) || 'Unknown Album';
   const albumArtist = artist ? sanitizeSegment(artist) : null;
 
@@ -106,7 +107,16 @@ async function findOrCreateAlbum({ name, artist, coverImageUrl }) {
 
   if (existing) {
     const update = { track_count: existing.track_count + 1 };
-    if (!existing.cover_image_url && coverImageUrl) update.cover_image_url = coverImageUrl;
+    // Albums are first-cover-wins (unlike stories below) — an album's
+    // cover is never replaced by a later track's upload, so there's no
+    // old file to delete here, just identifiers to fill in if this is
+    // the album's very first cover.
+    if (!existing.cover_image_url && coverImageUrl) {
+      update.cover_image_url = coverImageUrl;
+      update.image_storage_account_id = coverStorageAccountId || null;
+      update.image_storage_file_id = coverStorageFileId || null;
+      update.image_storage_hash = coverStorageHash || null;
+    }
     const { data: updated, error: updErr } = await supabase
       .from('albums').update(update).eq('id', existing.id).select().single();
     if (updErr) throw new Error(updErr.message);
@@ -115,7 +125,12 @@ async function findOrCreateAlbum({ name, artist, coverImageUrl }) {
 
   const { data: created, error: createErr } = await supabase
     .from('albums')
-    .insert({ name: albumName, artist: albumArtist, cover_image_url: coverImageUrl, track_count: 1 })
+    .insert({
+      name: albumName, artist: albumArtist, cover_image_url: coverImageUrl, track_count: 1,
+      image_storage_account_id: coverStorageAccountId || null,
+      image_storage_file_id: coverStorageFileId || null,
+      image_storage_hash: coverStorageHash || null
+    })
     .select().single();
   if (createErr) throw new Error(createErr.message);
   return created;
@@ -129,7 +144,7 @@ async function findOrCreateAlbum({ name, artist, coverImageUrl }) {
 // like albums.track_count. Requires migration_story_series.sql to have
 // been run — if the story_series table doesn't exist yet, this throws
 // and the caller surfaces that as a 500 with the real Postgres error.
-async function findOrCreateStorySeries({ title, narrator, coverImageUrl }) {
+async function findOrCreateStorySeries({ title, narrator, coverImageUrl, coverStorageAccountId, coverStorageFileId, coverStorageHash }) {
   const seriesTitle = sanitizeSegment(title);
 
   const { data: existing, error: findErr } = await supabase
@@ -142,17 +157,39 @@ async function findOrCreateStorySeries({ title, narrator, coverImageUrl }) {
     // story's cover can be replaced any time the admin manually
     // uploads a fresh one — the caller in POST /api/media then
     // propagates it to every existing episode of the series too.
-    if (coverImageUrl) update.cover_image_url = coverImageUrl;
+    const isReplacingCover = Boolean(coverImageUrl) && existing.cover_image_url !== coverImageUrl;
+    if (coverImageUrl) {
+      update.cover_image_url = coverImageUrl;
+      update.image_storage_account_id = coverStorageAccountId || null;
+      update.image_storage_file_id = coverStorageFileId || null;
+      update.image_storage_hash = coverStorageHash || null;
+    }
     if (!existing.narrator && narrator) update.narrator = narrator;
     const { data: updated, error: updErr } = await supabase
       .from('story_series').update(update).eq('id', existing.id).select().single();
     if (updErr) throw new Error(updErr.message);
+
+    // Clean up the file this series' cover used to point at — only
+    // after the row above is safely repointed at the new one, and only
+    // best-effort: an old row predating these columns (existing.
+    // image_storage_file_id null) or a Drime hiccup here must never
+    // fail the actual upload the admin is waiting on.
+    if (isReplacingCover && existing.image_storage_account_id && existing.image_storage_file_id) {
+      coverImageStorage
+        .deleteImage({ accountId: existing.image_storage_account_id, storageFileId: existing.image_storage_file_id })
+        .catch((e) => console.error('[media create] failed to delete replaced story cover (continuing):', e.response?.data?.message || e.message));
+    }
     return updated;
   }
 
   const { data: created, error: createErr } = await supabase
     .from('story_series')
-    .insert({ title: seriesTitle, narrator: narrator || null, cover_image_url: coverImageUrl || null, episode_count: 1 })
+    .insert({
+      title: seriesTitle, narrator: narrator || null, cover_image_url: coverImageUrl || null, episode_count: 1,
+      image_storage_account_id: coverStorageAccountId || null,
+      image_storage_file_id: coverStorageFileId || null,
+      image_storage_hash: coverStorageHash || null
+    })
     .select().single();
   if (createErr) throw new Error(createErr.message);
   return created;
@@ -167,7 +204,8 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
   const {
     type, title, artistOrNarrator, albumOrSeries, coverImageUrl, durationSeconds,
     fileSizeBytes, storageProvider, storageAccountId, storageFileId, storageHash, storagePath, contentLabelId,
-    chapterNumber, storyTitle, episodeTitle
+    chapterNumber, storyTitle, episodeTitle,
+    coverStorageAccountId, coverStorageFileId, coverStorageHash
   } = req.body;
 
   if (!type || !storageProvider || !storageAccountId || !storageFileId || !storageHash || !storagePath) {
@@ -215,7 +253,8 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
     if (!title) return res.status(400).json({ error: 'title is required for music' });
     try {
       const album = await findOrCreateAlbum({
-        name: albumOrSeries, artist: artistOrNarrator, coverImageUrl
+        name: albumOrSeries, artist: artistOrNarrator, coverImageUrl,
+        coverStorageAccountId, coverStorageFileId, coverStorageHash
       });
       insertRow.title = title;
       insertRow.album_or_series = album.name;
@@ -251,7 +290,8 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
     }
     try {
       const series = await findOrCreateStorySeries({
-        title: storyTitle, narrator: artistOrNarrator, coverImageUrl
+        title: storyTitle, narrator: artistOrNarrator, coverImageUrl,
+        coverStorageAccountId, coverStorageFileId, coverStorageHash
       });
       insertRow.story_series_id = series.id;
       insertRow.cover_image_url = series.cover_image_url || null;
