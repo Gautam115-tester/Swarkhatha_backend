@@ -6,9 +6,11 @@
 //
 // Fetches audio bytes directly from Drime and streams them to the
 // listener, so the heavy traffic never touches Render's Hobby-plan
-// bandwidth cap. Render is only asked for a tiny JSON credential lookup
-// per request (see GET /api/storage/resolve-media/:id in
-// routes/storage.js) — never for the audio bytes themselves.
+// bandwidth cap. The tiny JSON credential lookup this needs (see GET
+// /api/storage/resolve-media/:id in routes/storage.js) is edge-cached
+// here for RESOLVE_CACHE_TTL_SECONDS, so Render is only actually asked
+// once per media item per TTL window — not once per play — see
+// resolveMediaCached() below for exactly what that trusts and why.
 //
 // SETUP (do this once)
 //   1. https://workers.cloudflare.com -> sign up (free, no card needed).
@@ -40,15 +42,25 @@
 
 const ORIGIN = 'https://swarkhatha-7nk1.onrender.com'; // <-- set this to your real Render URL
 
+// How long a resolved (mediaItemId -> Drime credentials) lookup is
+// trusted at the edge before it's re-fetched from Render. Deliberately
+// matches accountCache.js's TTL on the Render side (5 min) — that file
+// already documents why 5 min is an acceptable staleness window for this
+// exact data (admin edits to a storage account are rare, and Render's
+// own PATCH /accounts/:id invalidates its cache immediately on write
+// anyway). This just extends the same accepted tradeoff to the edge
+// instead of inventing a new one.
+const RESOLVE_CACHE_TTL_SECONDS = 300;
+
 export default {
-  async fetch(request, url_, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (
       request.method === 'GET' &&
       (url.pathname.startsWith('/api/storage/stream/') || url.pathname.startsWith('/api/storage/file/'))
     ) {
-      return handleAudio(request, url, env);
+      return handleAudio(request, url, env, ctx);
     }
 
     // This worker must only ever serve audio — everything else (auth,
@@ -58,11 +70,13 @@ export default {
 };
 
 /* ------------------------------------------------------------------
- * AUDIO STREAMING/DOWNLOADS — never cached (each request carries a
- * short-lived, single-use token and Range headers vary per request),
- * just proxied straight through from Drime to the listener.
+ * AUDIO STREAMING/DOWNLOADS — the audio bytes themselves are still
+ * never cached (each request carries a short-lived, single-use token
+ * and Range headers vary per request), just proxied straight through
+ * from Drime to the listener. The *credential lookup* that precedes
+ * them (resolveMediaCached, below) is what's now cached.
  * ------------------------------------------------------------------ */
-async function handleAudio(request, url, env) {
+async function handleAudio(request, url, env, ctx) {
   const parts = url.pathname.split('/').filter(Boolean); // ['api','storage','stream'|'file', mediaItemId]
   const kind = parts[2]; // 'stream' or 'file'
   const mediaItemId = parts[3];
@@ -84,20 +98,14 @@ async function handleAudio(request, url, env) {
     return new Response('Token does not match this request', { status: 401 });
   }
 
-  // Ask Render to resolve this media item -> Drime credentials. This is
-  // the only part of an audio request that still touches Render, and
-  // it's a few hundred bytes of JSON regardless of file size.
+  // Resolve this media item -> Drime credentials, via the edge cache
+  // when possible instead of always asking Render. See
+  // resolveMediaCached for exactly what is/isn't trusted here.
   let resolved;
   try {
-    const resolveResp = await fetch(`${ORIGIN.replace(/\/$/, '')}/api/storage/resolve-media/${mediaItemId}`, {
-      headers: { 'X-Internal-Secret': env.INTERNAL_SECRET }
-    });
-    if (!resolveResp.ok) {
-      return new Response('Failed to resolve media from origin', { status: 502 });
-    }
-    resolved = await resolveResp.json();
+    resolved = await resolveMediaCached(mediaItemId, env, ctx);
   } catch (e) {
-    return new Response('Origin unreachable', { status: 502 });
+    return new Response('Failed to resolve media from origin', { status: 502 });
   }
 
   const { accessToken, hash, fileName, drimeApiBase } = resolved;
@@ -130,6 +138,75 @@ async function handleAudio(request, url, env) {
   }
 
   return new Response(upstream.body, { status: upstream.status, headers });
+}
+
+/* ------------------------------------------------------------------
+ * Edge-cached (mediaItemId -> Drime credentials) lookup.
+ *
+ * Before this, every single play — from every listener, even repeat
+ * plays of the same popular track seconds apart — cost Render one live
+ * round trip here. That's the one part of a stream request that scales
+ * with (active users x plays), not with catalog size, so it's the
+ * actual bottleneck once Render itself is warm and audio bytes already
+ * bypass Render entirely.
+ *
+ * Security properties this relies on, spelled out explicitly rather
+ * than assumed:
+ *  - The cache key is built ONLY from mediaItemId, and mediaItemId only
+ *    reaches this function after handleAudio has already verified it
+ *    against a signed, expiring JWT (payload.mid === mediaItemId). A
+ *    request can't poison or probe an arbitrary cache entry with raw
+ *    unauthenticated input — it has to hold a valid token for that
+ *    exact media item first.
+ *  - The cache key is a synthetic internal Request
+ *    (https://internal-cache.swarkatha/...) that is never derived from,
+ *    and never matches, any URL a real client can send. It only exists
+ *    as a lookup key inside caches.default and is not reachable by any
+ *    incoming fetch.
+ *  - The cached JSON contains a live Drime access token — the same
+ *    sensitivity as what Render's accountCache.js already holds
+ *    in-memory for 5 minutes today. This does not introduce a new kind
+ *    of exposure, it extends an already-accepted one to the edge, with
+ *    the same TTL. It is stored in Cloudflare's private edge cache
+ *    (caches.default), not a public/shared CDN cache, and this
+ *    function's return value is used only internally to build the
+ *    upstream Drime request below — it is never written into any
+ *    Response returned to a client.
+ *  - ctx.waitUntil lets the cache write happen after the response to
+ *    the *first* (cache-miss) request has already started streaming,
+ *    so warming the cache never adds latency to the request that
+ *    triggers it.
+ * ------------------------------------------------------------------ */
+async function resolveMediaCached(mediaItemId, env, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(`https://internal-cache.swarkatha/resolve-media/${mediaItemId}`);
+
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    return await cached.json();
+  }
+
+  const resolveResp = await fetch(`${ORIGIN.replace(/\/$/, '')}/api/storage/resolve-media/${mediaItemId}`, {
+    headers: { 'X-Internal-Secret': env.INTERNAL_SECRET }
+  });
+  if (!resolveResp.ok) {
+    throw new Error(`resolve-media returned ${resolveResp.status}`);
+  }
+  const resolved = await resolveResp.json();
+
+  const toCache = new Response(JSON.stringify(resolved), {
+    headers: {
+      'Content-Type': 'application/json',
+      'Cache-Control': `private, max-age=${RESOLVE_CACHE_TTL_SECONDS}`
+    }
+  });
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    ctx.waitUntil(cache.put(cacheKey, toCache));
+  } else {
+    await cache.put(cacheKey, toCache);
+  }
+
+  return resolved;
 }
 
 /* ------------------------------------------------------------------
