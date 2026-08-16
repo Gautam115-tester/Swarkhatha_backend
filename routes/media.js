@@ -6,6 +6,7 @@ const { decrypt } = require('../lib/crypto');
 const drime = require('../lib/drime');
 const coverImageStorage = require('../lib/coverImageStorage');
 const mediaItemCache = require('../lib/mediaItemCache');
+const autoCategorize = require('../lib/autoCategorize');
 
 const router = express.Router();
 
@@ -324,6 +325,50 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
   const { data, error } = await supabase.from('media_items').insert(insertRow).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ item: data });
+
+  // Fire-and-forget, AFTER responding: only when the admin didn't pick a
+  // label themselves (categoryText is null). Never awaited/blocking --
+  // an LLM call must never be why an upload takes longer or fails, and
+  // autoCategorizeIfMissing is itself best-effort (a genuine "no confident
+  // match" just leaves the row as-is, same as if this were never called).
+  if (!categoryText) {
+    autoCategorize.autoCategorizeIfMissing(data.id).catch((e) =>
+      console.error(`[media create] auto-categorize failed for ${data.id} (continuing):`, e.message)
+    );
+  }
+});
+
+// Admin: kick off categorizing every existing item that's missing one
+// ("old music" that predates this feature, or was uploaded without a
+// label picked). Runs in the background -- responds immediately with how
+// many rows are queued, since a large catalog backfill can take a while
+// (see lib/autoCategorize.js's pacing comment) and there's no reason to
+// hold the HTTP request open for it. The admin app can re-check progress
+// via GET /backfill-categories/status.
+let _backfillStatus = { running: false, done: 0, total: 0, categorized: 0 };
+
+router.post('/backfill-categories', requireAuth, requireAdmin, async (req, res) => {
+  if (_backfillStatus.running) {
+    return res.status(409).json({ error: 'A backfill is already running', status: _backfillStatus });
+  }
+  _backfillStatus = { running: true, done: 0, total: 0, categorized: 0 };
+  res.json({ started: true });
+
+  try {
+    await autoCategorize.backfillMissingCategories({
+      onProgress: ({ done, total, categorized }) => {
+        _backfillStatus = { running: true, done, total, categorized };
+      }
+    });
+  } catch (e) {
+    console.error('[media backfill-categories] failed:', e.message);
+  } finally {
+    _backfillStatus = { ..._backfillStatus, running: false };
+  }
+});
+
+router.get('/backfill-categories/status', requireAuth, requireAdmin, async (req, res) => {
+  res.json(_backfillStatus);
 });
 
 // List albums (music) — used by the admin app to show existing albums,
