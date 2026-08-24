@@ -9,6 +9,9 @@ const labelsRoutes = require('./routes/labels');
 const usersRoutes = require('./routes/users');
 const aiAccountsRoutes = require('./routes/aiAccounts');
 const transcriptsRoutes = require('./routes/transcripts');
+const followsRoutes = require('./routes/follows');
+const ratingsRoutes = require('./routes/ratings');
+const statsRoutes = require('./routes/stats');
 
 const app = express();
 // Render sits behind its own reverse proxy — without this, every request
@@ -28,6 +31,9 @@ app.use('/api/labels', labelsRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/ai-accounts', aiAccountsRoutes);
 app.use('/api/transcripts', transcriptsRoutes);
+app.use('/api/follows', followsRoutes);
+app.use('/api/ratings', ratingsRoutes);
+app.use('/api/stats', statsRoutes);
 
 // --- JSON 404 handler ---------------------------------------------------
 // Any request that doesn't match a route above used to fall through to
