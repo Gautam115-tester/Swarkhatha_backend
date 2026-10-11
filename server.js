@@ -13,6 +13,7 @@ const followsRoutes = require('./routes/follows');
 const ratingsRoutes = require('./routes/ratings');
 const statsRoutes = require('./routes/stats');
 const lyricsRoutes = require('./routes/lyrics');
+const playlistsRoutes = require('./routes/playlists');
 
 const app = express();
 // Render sits behind its own reverse proxy — without this, every request
@@ -38,6 +39,7 @@ app.use('/api/follows', followsRoutes);
 app.use('/api/ratings', ratingsRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/lyrics', lyricsRoutes);
+app.use('/api/playlists', playlistsRoutes);
 
 // --- JSON 404 handler ---------------------------------------------------
 // Any request that doesn't match a route above used to fall through to
