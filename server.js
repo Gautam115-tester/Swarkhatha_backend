@@ -12,6 +12,7 @@ const transcriptsRoutes = require('./routes/transcripts');
 const followsRoutes = require('./routes/follows');
 const ratingsRoutes = require('./routes/ratings');
 const statsRoutes = require('./routes/stats');
+const lyricsRoutes = require('./routes/lyrics');
 
 const app = express();
 // Render sits behind its own reverse proxy — without this, every request
@@ -20,6 +21,8 @@ const app = express();
 // per-IP rate limiting either useless or wrongly punish everyone at once.
 app.set('trust proxy', 1);
 app.use(cors());
+// gzip JSON (the catalog is large). Optional: skipped if the package is missing.
+try { app.use(require('compression')()); } catch (_) { /* npm i compression */ }
 app.use(express.json());
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'swarkatha-backend' }));
@@ -34,6 +37,7 @@ app.use('/api/transcripts', transcriptsRoutes);
 app.use('/api/follows', followsRoutes);
 app.use('/api/ratings', ratingsRoutes);
 app.use('/api/stats', statsRoutes);
+app.use('/api/lyrics', lyricsRoutes);
 
 // --- JSON 404 handler ---------------------------------------------------
 // Any request that doesn't match a route above used to fall through to

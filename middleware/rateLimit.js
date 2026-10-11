@@ -50,4 +50,13 @@ const mediaLimiter = rateLimit({
   handler: jsonHandler
 });
 
-module.exports = { authLimiter, mediaLimiter };
+// Lyrics: the app prefetches the current track, so allow a healthy rate.
+const lyricsLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: jsonHandler
+});
+
+module.exports = { authLimiter, mediaLimiter, lyricsLimiter };
