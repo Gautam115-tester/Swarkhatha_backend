@@ -71,10 +71,10 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`SwarKatha backend running on port ${PORT}`);
-  // The 8s Drime storage-usage poll (lib/liveAccountsMonitor.js)
-  // is intentionally NOT started here. It starts itself the moment the
-  // first admin app opens the storage screen and connects to
-  // GET /api/storage/accounts/live, and stops itself once the last
-  // admin app closes/disconnects — see acquire()/release() there and
-  // in routes/storage.js. No admin app open = no Drime traffic.
+  // Drime storage-usage checks (lib/liveAccountsMonitor.js): every 30 s
+  // while an admin app is connected, every 25 min otherwise. init()
+  // loads the last known numbers from Supabase and arms the background
+  // timer. On Render's free tier the instance sleeps, so also set up
+  // an external scheduler for POST /api/storage/accounts/background-check.
+  require('./lib/liveAccountsMonitor').init().catch((e) => console.error('[liveMonitor] init failed:', e.message));
 });

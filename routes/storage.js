@@ -143,58 +143,116 @@ router.post('/accounts', requireAuth, requireAdmin, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
- * 2) LIST ACCOUNTS + LIVE FREE SPACE  (admin only)
- *    Serves the in-memory cache instantly (refreshed in the
- *    background every STORAGE_REFRESH_INTERVAL_MS — see
- *    lib/liveAccountsMonitor.js). Pass ?force=true to block for a
- *    fresh Drime pull right now instead of the cached snapshot
- *    (useful right after adding/editing an account).
+ * 2) LIST ACCOUNTS + FREE SPACE  (admin only)
+ *    Serves the cached snapshot instantly (see lib/liveAccountsMonitor.js
+ *    for how the cache is kept warm and when Drime is actually called).
+ *    Also counts as "an admin is here" (touch), so the 30 s refresh keeps
+ *    running for clients whose SSE stream is blocked and who poll this
+ *    route instead.
+ *
+ *    ?force=true blocks for a fresh Drime pull — but not more often than
+ *    every FORCE_MIN_GAP_MS, so a button mash can't hammer Drime.
  * ------------------------------------------------------------------ */
+const FORCE_MIN_GAP_MS = 5000;
+
 router.get('/accounts', requireAuth, requireAdmin, async (req, res) => {
+  liveMonitor.touch();
   if (req.query.force === 'true') {
-    await liveMonitor.refreshAll();
+    await liveMonitor.refreshIfStale(FORCE_MIN_GAP_MS);
+  } else {
+    await liveMonitor.hydrate(); // cold server: load last_known_* instead of starting empty
+    if (liveMonitor.getSnapshot().length === 0) {
+      await liveMonitor.refreshIfStale(liveMonitor.FAST_MS);
+    }
   }
-  const snapshot = liveMonitor.getSnapshot();
-  if (snapshot.length === 0) {
-    // Cache hasn't populated yet (e.g. right after server boot) — do
-    // one synchronous refresh so the admin doesn't see an empty list.
-    await liveMonitor.refreshAll();
-  }
-  res.json({ accounts: liveMonitor.getSnapshot(), refreshIntervalMs: Number(process.env.STORAGE_REFRESH_INTERVAL_MS || 8000) });
+  res.json({
+    accounts: liveMonitor.getSnapshot(),
+    refreshIntervalMs: liveMonitor.FAST_MS,
+    backgroundIntervalMs: liveMonitor.BACKGROUND_MS,
+    snapshotAgeMs: Number.isFinite(liveMonitor.ageMs()) ? liveMonitor.ageMs() : null
+  });
 });
 
 /* ------------------------------------------------------------------
- * 2b) LIVE STREAM (admin only) — Server-Sent Events. Pushes the
- *     current cached snapshot once a second so a dashboard can just
- *     render whatever arrives, no client-side polling/timers needed.
+ * 2b) LIVE STREAM (admin only) — Server-Sent Events.
  *
- *     This connection is also what turns the monitor's background
- *     Drime poll on and off: connecting calls liveMonitor.acquire(),
- *     which starts the poll if this is the first admin connected; the
- *     req.on('close') handler calls liveMonitor.release(), which stops
- *     the poll once the last admin has disconnected.
+ *     Connecting = "admin app is open": acquire() starts the 30 s
+ *     refresh; closing releases it, and once nobody is left the monitor
+ *     drops back to its 25 min background cadence.
+ *
+ *     On connect the cached snapshot goes out immediately (no waiting on
+ *     Drime). After that a frame is sent only when a refresh completes —
+ *     i.e. about every 30 s — plus a comment line every 15 s so
+ *     Render's/Cloudflare's idle timeouts don't kill the connection and
+ *     so a dead client socket is noticed (the failed write fires 'close').
  * ------------------------------------------------------------------ */
-router.get('/accounts/live', requireAuth, requireAdmin, (req, res) => {
+router.get('/accounts/live', requireAuth, requireAdmin, async (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
+  req.socket.setTimeout?.(0);
+  req.socket.setKeepAlive?.(true, 15000);
 
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-  liveMonitor.acquire();
-  send(liveMonitor.getSnapshot());
-
-  const heartbeat = setInterval(() => send(liveMonitor.getSnapshot()), 1000);
+  let released = false;
+  let ping = null;
+  const send = (data) => { if (!released) res.write(`data: ${JSON.stringify(data)}\n\n`); };
   const onUpdate = (snapshot) => send(snapshot);
-  liveMonitor.on('update', onUpdate);
-
-  req.on('close', () => {
-    clearInterval(heartbeat);
+  const cleanup = () => {
+    if (released) return; // 'close' can fire on both req and res
+    released = true;
+    if (ping) clearInterval(ping);
     liveMonitor.off('update', onUpdate);
     liveMonitor.release();
-  });
+  };
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+  res.on('error', cleanup);
+
+  liveMonitor.acquire(); // starts the 30 s refresh (immediately only if the cache is older than 30 s)
+  liveMonitor.on('update', onUpdate);
+  ping = setInterval(() => { if (!released) res.write(': ping\n\n'); }, 15000);
+
+  await liveMonitor.hydrate();
+  send(liveMonitor.getSnapshot());
+});
+
+/* ------------------------------------------------------------------
+ * 2c) BACKGROUND CHECK — for an external scheduler (cron-job.org, a
+ *     Cloudflare Worker cron trigger, ...). Needed on Render's free tier,
+ *     where the instance sleeps and in-process timers can't fire; the
+ *     request itself wakes the server and runs one check.
+ *
+ *     Not an admin JWT route (a scheduler has no login): protected by a
+ *     shared secret in the x-cron-secret header. With STORAGE_CRON_SECRET
+ *     unset the route answers 404, so it can't be hit by accident.
+ *     Skips the Drime calls if the cache is younger than 10 min.
+ * ------------------------------------------------------------------ */
+const BACKGROUND_CHECK_MIN_AGE_MS = 10 * 60 * 1000;
+
+router.post('/accounts/background-check', async (req, res) => {
+  const secret = process.env.STORAGE_CRON_SECRET;
+  if (!secret) return res.status(404).json({ error: 'Not found' });
+  const given = Buffer.from(String(req.get('x-cron-secret') || ''));
+  const want = Buffer.from(secret);
+  if (given.length !== want.length || !require('crypto').timingSafeEqual(given, want)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const { refreshed, ageMs } = await liveMonitor.refreshIfStale(BACKGROUND_CHECK_MIN_AGE_MS);
+    const snap = liveMonitor.getSnapshot();
+    res.json({
+      ok: true,
+      refreshed,
+      accounts: snap.length,
+      errors: snap.filter((a) => a.status !== 'ok').length,
+      cacheAgeSec: Math.round(ageMs / 1000)
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Admin: rename/re-tag an account

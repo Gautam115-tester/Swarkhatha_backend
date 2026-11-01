@@ -113,10 +113,15 @@ that had MediaFire storage accounts connected, also run
 `supabase/migration_drime_only.sql` last.
 
 Optional env vars (see `.env.example`):
-- `STORAGE_REFRESH_INTERVAL_MS` (default `8000`) — how often the backend polls each
-  Drime account in the background for the live storage dashboard
-  (`GET /api/storage/accounts/live`, an SSE stream consumed by the admin app's Storage
-  screen).
+- `STORAGE_REFRESH_INTERVAL_MS` (default `30000`) — how often each Drime account's
+  disk usage is checked **while an admin app is open** (connected to
+  `GET /api/storage/accounts/live`, or polling `GET /api/storage/accounts`).
+- `STORAGE_BACKGROUND_INTERVAL_MS` (default `1500000`, 25 min) — how often it is checked
+  **while no admin app is open**. This is an in-process timer, so it only runs while the
+  instance is awake; on Render's free tier add the external scheduler below.
+- `STORAGE_CRON_SECRET` — enables `POST /api/storage/accounts/background-check`
+  (header `x-cron-secret`). Point a scheduler at it every ~25 min — see
+  `cdn-worker/storage-check-cron-worker.js`. Unset = the route returns 404.
 - `STREAM_TOKEN_TTL_SECONDS` (default `900`) — how long the signed stream/download
   URLs returned by `stream-url`/`download-url` stay valid before the app needs to ask
   for a fresh one.
