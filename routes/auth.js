@@ -5,6 +5,8 @@ const { sendPasswordResetEmail } = require('../lib/mailer');
 const jwt = require('jsonwebtoken');
 const supabase = require('../lib/supabaseClient');
 const { authLimiter } = require('../middleware/rateLimit');
+const { signUserToken } = require('../middleware/auth');
+const devices = require('../lib/devices');
 
 const router = express.Router();
 
@@ -59,21 +61,33 @@ router.post('/login', authLimiter, async (req, res) => {
       return res.status(403).json({ error: 'Your signup request was not approved.', status: 'rejected' });
     }
 
-    const token = issueToken(user);
-    res.json({ token, user: publicUser(user) });
+    // Listeners are registered to the physical device they sign in from
+    // (atomically, against their device limit). Admins are never device-bound.
+    let deviceId = null;
+    let device = null;
+    if (user.role === 'listener' && devices.deviceEnforced()) {
+      const parsed = devices.parseDevicePayload(req.body.device);
+      if (parsed.error) {
+        return res.status(400).json({
+          code: 'device_info_required',
+          error: 'Please update the SwarKatha app to the latest version to sign in.',
+        });
+      }
+      const reg = await devices.registerDevice(user.id, parsed.device);
+      const failure = devices.registrationFailure(reg);
+      if (failure) return res.status(failure.status).json(failure.body);
+      deviceId = reg.device.id;
+      device = { id: reg.device.id, limit: reg.limit, activeCount: reg.activeCount };
+    }
+
+    const token = signUserToken(user, deviceId);
+    res.json({ token, user: publicUser(user), ...(device ? { device } : {}) });
   } catch (err) {
     console.error('login error:', err);
     res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
 
-function issueToken(user) {
-  return jwt.sign(
-    { sub: user.id, email: user.email, role: user.role },
-    process.env.JWT_SECRET,
-    { expiresIn: '30d' }
-  );
-}
 function publicUser(u) {
   return { id: u.id, email: u.email, displayName: u.display_name, role: u.role, status: u.status };
 }

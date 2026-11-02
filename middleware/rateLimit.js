@@ -59,4 +59,23 @@ const lyricsLimiter = rateLimit({
   handler: jsonHandler
 });
 
-module.exports = { authLimiter, mediaLimiter, lyricsLimiter };
+// Device registration / heartbeat: an app resume or relogin is cheap but must
+// not become an unbounded write path.
+const deviceLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: jsonHandler
+});
+
+// Trial claims: one per email ever, so a handful per hour per IP is plenty.
+const trialLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: jsonHandler
+});
+
+module.exports = { authLimiter, mediaLimiter, lyricsLimiter, deviceLimiter, trialLimiter };

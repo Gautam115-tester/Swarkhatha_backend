@@ -1,0 +1,49 @@
+// Seeds a realistic scenario through the REAL routes and writes the raw JSON
+// the apps would receive, so the Dart models can be checked against it.
+process.env.SK_INTEGRATION = '1';
+const path = '/home/claude/work/Swarkhatha_backend';
+process.chdir(path);
+const fs = require('fs');
+const jwt = require('jsonwebtoken'), bcrypt = require('bcryptjs'), http = require('http'), express = require('express');
+process.env.SUPABASE_URL = 'http://127.0.0.1:3200'; process.env.JWT_SECRET = 'fx'; process.env.DEVICE_HASH_SECRET = 'fx';
+process.env.TOKEN_ENC_KEY = 'a'.repeat(64); process.env.SUBSCRIPTION_TZ = 'Asia/Kolkata';
+process.env.DEVICE_CHECK_TTL_MS = '0'; process.env.ENTITLEMENT_CACHE_TTL_MS = '0';
+process.env.SUPABASE_SERVICE_ROLE_KEY = jwt.sign({ role: 'service_role' }, 'super-secret-jwt-token-with-at-least-32-characters-long');
+const rl = require.resolve(path + '/middleware/rateLimit'); const pass = (a, b, n) => n();
+require.cache[rl] = { id: rl, filename: rl, loaded: true, exports: { authLimiter: pass, mediaLimiter: pass, lyricsLimiter: pass, deviceLimiter: pass, trialLimiter: pass } };
+const supabase = require(path + '/lib/supabaseClient'); const ent = require(path + '/middleware/entitlement');
+require(path + '/lib/mailer').sendSubscriptionEmail = async () => {};
+(async () => {
+  const app = express(); app.use(express.json());
+  app.use('/api/auth', require(path + '/routes/auth')); app.use('/api/devices', require(path + '/routes/devices'));
+  app.use('/api/admin', require(path + '/routes/adminUsers')); app.use('/api/subscriptions', ent.deviceGate, require(path + '/routes/subscriptions'));
+  const srv = http.createServer(app); await new Promise((r) => srv.listen(0, '127.0.0.1', r)); const base = `http://127.0.0.1:${srv.address().port}`;
+  const call = async (m, u, t, b) => { const r = await fetch(base + u, { method: m, headers: { 'Content-Type': 'application/json', ...(t ? { Authorization: 'Bearer ' + t } : {}) }, body: b === undefined ? undefined : JSON.stringify(b) }); return { status: r.status, json: await r.json().catch(() => null) }; };
+  const tag = Date.now().toString(36);
+  const mk = async (email, role = 'listener', limit) => (await supabase.from('app_users').insert({ email, password_hash: bcrypt.hashSync('pw', 4), display_name: email.split('@')[0], role, status: 'approved', ...(limit ? { device_limit: limit } : {}) }).select().single()).data;
+  const admin = await mk(`fx-admin-${tag}@x.test`, 'admin'); const at = jwt.sign({ sub: admin.id, email: admin.email, role: 'admin' }, 'fx');
+  const phone = (id, o = {}) => ({ platform: 'android', androidId: 'aid' + id + tag, hardwareId: Buffer.from('drm' + id + tag).toString('hex').padEnd(32, '0'), hardwareSignature: Buffer.from('hw' + id + tag).toString('hex').padEnd(32, '0'), installId: 'i' + id + tag, manufacturer: 'Samsung', model: 'SM-A546E', osVersion: 'Android 14 (API 34)', appVersion: '2.0.0', userHandle: 0, cloneReasons: [], secondaryEnv: false, ...o });
+  const u = await mk(`fx-trial-${tag}@x.test`, 'listener', 3);
+  const login = (d) => call('POST', '/api/auth/login', null, { email: u.email, password: 'pw', device: d });
+  const l1 = await login(phone('a')); const l2 = await login(phone('b', { userHandle: 10, secondaryEnv: true, cloneReasons: ['secondary_user'], hardwareId: undefined, hardwareSignature: Buffer.from('hwb' + tag).toString('hex').padEnd(32, '0') }));
+  const tok = l1.json.token;
+  const claim = await call('POST', '/api/subscriptions/me/trial', tok);
+  const devs = (await call('GET', `/api/admin/users/${u.id}/devices`, at)).json;
+  await call('POST', `/api/admin/users/${u.id}/devices/${devs.devices[1].id}/block`, at);
+  const paid = await mk(`fx-paid-${tag}@x.test`); await call('POST', `/api/subscriptions/${paid.id}/assign`, at, { plan: 90 });
+  const out = {
+    login_ok: l1.json, login_limit: (await (async () => { const v = await mk(`fx-limit-${tag}@x.test`); await call('POST', '/api/auth/login', null, { email: v.email, password: 'pw', device: phone('l1') }); return call('POST', '/api/auth/login', null, { email: v.email, password: 'pw', device: phone('l2') }); })()).json,
+    me_trial: (await call('GET', '/api/subscriptions/me', tok)).json,
+    claim_again: (await call('POST', '/api/subscriptions/me/trial', tok)).json,
+    admin_list: (await call('GET', `/api/subscriptions?limit=100&q=${tag}`, at)).json,
+    admin_detail: (await call('GET', `/api/subscriptions/${u.id}`, at)).json,
+    admin_devices: (await call('GET', `/api/admin/users/${u.id}/devices`, at)).json,
+    admin_activity: (await call('GET', `/api/admin/activity?limit=20&userId=${u.id}`, at)).json,
+    expired_trial_me: null,
+  };
+  await supabase.from('subscriptions').update({ expires_at: new Date(Date.now() - 3600e3).toISOString() }).eq('user_id', u.id); ent.clearEntitlementCache();
+  out.expired_trial_me = (await call('GET', '/api/subscriptions/me', tok)).json;
+  fs.mkdirSync('/tmp/fixtures', { recursive: true }); fs.writeFileSync('/tmp/fixtures/live.json', JSON.stringify(out, null, 1));
+  console.log('claim status ok:', claim.status === 200, '| keys:', Object.keys(out).join(','));
+  srv.close(); process.exit(0);
+})().catch((e) => { console.error('FAILED', e); process.exit(1); });

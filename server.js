@@ -14,6 +14,10 @@ const ratingsRoutes = require('./routes/ratings');
 const statsRoutes = require('./routes/stats');
 const lyricsRoutes = require('./routes/lyrics');
 const playlistsRoutes = require('./routes/playlists');
+const subscriptionsRoutes = require('./routes/subscriptions');
+const devicesRoutes = require('./routes/devices');
+const adminUsersRoutes = require('./routes/adminUsers');
+const { deviceGate } = require('./middleware/entitlement');
 
 const app = express();
 // Render sits behind its own reverse proxy — without this, every request
@@ -29,17 +33,24 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true, service: 'swarkatha-backend' }));
 
 app.use('/api/auth', authRoutes);
-app.use('/api/storage', storageRoutes);
-app.use('/api/media', mediaRoutes);
-app.use('/api/labels', labelsRoutes);
+app.use('/api/devices', devicesRoutes);
+app.use('/api/admin', adminUsersRoutes);
 app.use('/api/users', usersRoutes);
+
+// deviceGate: a listener token must belong to a registered, un-blocked device
+// within the user's limit (middleware/entitlement.js). Admin tokens and
+// requests with no/invalid token pass through to each route's own auth.
+app.use('/api/storage', deviceGate, storageRoutes);
+app.use('/api/media', deviceGate, mediaRoutes);
+app.use('/api/labels', deviceGate, labelsRoutes);
 app.use('/api/ai-accounts', aiAccountsRoutes);
-app.use('/api/transcripts', transcriptsRoutes);
-app.use('/api/follows', followsRoutes);
-app.use('/api/ratings', ratingsRoutes);
-app.use('/api/stats', statsRoutes);
-app.use('/api/lyrics', lyricsRoutes);
-app.use('/api/playlists', playlistsRoutes);
+app.use('/api/transcripts', deviceGate, transcriptsRoutes);
+app.use('/api/follows', deviceGate, followsRoutes);
+app.use('/api/ratings', deviceGate, ratingsRoutes);
+app.use('/api/stats', deviceGate, statsRoutes);
+app.use('/api/lyrics', deviceGate, lyricsRoutes);
+app.use('/api/playlists', deviceGate, playlistsRoutes);
+app.use('/api/subscriptions', deviceGate, subscriptionsRoutes);
 
 // --- JSON 404 handler ---------------------------------------------------
 // Any request that doesn't match a route above used to fall through to
@@ -77,4 +88,9 @@ app.listen(PORT, () => {
   // timer. On Render's free tier the instance sleeps, so also set up
   // an external scheduler for POST /api/storage/accounts/background-check.
   require('./lib/liveAccountsMonitor').init().catch((e) => console.error('[liveMonitor] init failed:', e.message));
+  // Subscription expiry reminders (7 / 3 / 1 days before, and on expiry):
+  // an hourly sweep while this instance is awake. Reminders are ALSO created
+  // when a listener opens the app and by POST /api/subscriptions/cron/run, so
+  // a sleeping Render instance can't cause a missed notification.
+  require('./lib/subscriptionNotifier').startScheduler();
 });

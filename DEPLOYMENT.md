@@ -14,6 +14,7 @@ need values from earlier ones.
    already had MediaFire storage accounts connected, also run
    `supabase/migration_mediafire_only.sql` and then `supabase/migration_drime_only.sql`
    last, in that order.
+   For manual subscriptions also run `supabase/migration_subscriptions.sql` (see README → *Manual subscriptions*).
 3. Go to **Project Settings → API**. Copy:
    - `Project URL` → this is `SUPABASE_URL`
    - `service_role` key (NOT `anon`) → this is `SUPABASE_SERVICE_ROLE_KEY`
@@ -155,3 +156,14 @@ more storage capacity.
 | `POST /api/media` returns "Missing required fields" | Make sure both `storageFileId` and `storageHash` from the `/api/storage/upload` response are passed through — Drime needs both (one to delete, one to stream) |
 
 Next: the Flutter app itself, wired to these endpoints.
+
+---
+
+## Free trial, device limits and enforcement
+
+Added on top of the manual subscriptions above. Still no payments. Run
+`supabase/migration_trials_devices.sql`, then read
+**[SUBSCRIPTIONS_TRIALS_DEVICES.md](SUBSCRIPTIONS_TRIALS_DEVICES.md)** for the rollout order,
+device-identification limits, enforcement flags (`SUBSCRIPTION_ENFORCEMENT`,
+`DEVICE_ENFORCEMENT`) and the API.
+

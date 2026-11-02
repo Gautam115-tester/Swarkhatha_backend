@@ -43,6 +43,12 @@ Supabase-Storage-backed deployment.
 | POST | `/api/storage/upload-image` | admin | uploads a cover image; auto-picks (or uses `accountId` for) an `image`-purpose account |
 | GET | `/api/storage/cover/:accountId/:hash` | public, no auth | proxies cover-image bytes from Drime — safe because `accountId` must be `purpose: 'image'` |
 | GET/POST/DELETE | `/api/media` | mixed | catalog CRUD, favorites, resume progress |
+| GET | `/api/subscriptions/me` | any logged-in user | own subscription (status, dates, remaining days) + unread count |
+| GET / POST | `/api/subscriptions/me/notifications[/read]` | any logged-in user | own expiry-reminder inbox / mark read |
+| GET | `/api/subscriptions?status=&q=&limit=&offset=` | admin | listener list with subscription status + summary counts |
+| GET / PATCH / DELETE | `/api/subscriptions/:userId` | admin | detail + history / modify / remove |
+| POST | `/api/subscriptions/:userId/assign` · `/renew` · `/extend` | admin | new term (plan + start date) / add days |
+| POST | `/api/subscriptions/cron/run` | `x-cron-secret` | run the expiry-reminder sweep (for an external scheduler) |
 
 ## Adding a storage account (admin flow)
 
@@ -144,3 +150,41 @@ fix that without moving off Supabase/Render/Drime.
 These come next — say the word and I'll build the Flutter side, wiring your existing
 `EqualizerManager.kt` / `MainActivity.kt` in for the music player's equalizer (and
 correctly leaving it out of the audio story player).
+
+
+## Manual subscriptions
+
+Admins assign subscriptions by hand — there are **no payments, billing or auto-renewals**.
+Run `supabase/migration_subscriptions.sql` once (after the other migrations).
+
+- **Plans:** 30 / 90 / 180 / 365 days or Lifetime. `end date = start date + duration`
+  (30 days from 1 Jan → 31 Jan). It stays valid through the end of that day and shows
+  *Expired* from the next day. Remaining days = end date − today (0 on the last day).
+- **Status** (Active, Expiring Soon ≤ 7 days, Expired, Lifetime, plus Not started / None)
+  and remaining days are **never stored** — they are derived from the dates on every read
+  (`lib/subscription.js`), so they can't go stale and the admin and listener apps always agree.
+- **Extend** adds days to the current end date (or starts a new term today if already expired).
+  **Renew / Assign** starts a new term from a chosen plan + start date. **Modify** edits plan,
+  start/end dates or the note. Every action is recorded in `subscription_history`.
+- **Reminders** at 7, 3 and 1 day(s) before expiry and on expiry go to the listener's in-app inbox
+  and by email (SMTP). Each is created at most once per term (`dedupe_key`), and a new set starts
+  when the end date changes. They are generated (a) when the listener opens the app, (b) hourly
+  while the instance is awake, and (c) by `POST /api/subscriptions/cron/run` — point an external
+  scheduler at it daily (same idea as `cdn-worker/storage-check-cron-worker.js`):
+
+  ```bash
+  curl -X POST https://<service>.onrender.com/api/subscriptions/cron/run -H "x-cron-secret: $SUBSCRIPTION_CRON_SECRET"
+  ```
+- `SUBSCRIPTION_TZ` (default `Asia/Kolkata`) decides which calendar day is "today".
+- Tests: `npm test` (date/status logic + the routes against an in-memory fake database).
+
+---
+
+## Free trial, device limits and enforcement
+
+Added on top of the manual subscriptions above. Still no payments. Run
+`supabase/migration_trials_devices.sql`, then read
+**[SUBSCRIPTIONS_TRIALS_DEVICES.md](SUBSCRIPTIONS_TRIALS_DEVICES.md)** for the rollout order,
+device-identification limits, enforcement flags (`SUBSCRIPTION_ENFORCEMENT`,
+`DEVICE_ENFORCEMENT`) and the API.
+

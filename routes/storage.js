@@ -3,6 +3,7 @@ const multer = require('multer');
 const supabase = require('../lib/supabaseClient');
 const { encrypt, decrypt } = require('../lib/crypto');
 const { requireAuth, requireAdmin, signMediaToken, requireMediaAccess } = require('../middleware/auth');
+const { requireEntitlement } = require('../middleware/entitlement');
 const drime = require('../lib/drime');
 const liveMonitor = require('../lib/liveAccountsMonitor');
 const coverImageStorage = require('../lib/coverImageStorage');
@@ -588,7 +589,7 @@ router.get('/media-item-cache-stats', requireAuth, requireAdmin, (req, res) => {
  *    returns a URL back into THIS backend's own /stream/:id proxy,
  *    which fetches from Drime server-side and pipes the bytes through.
  * ------------------------------------------------------------------ */
-router.get('/stream-url/:mediaItemId', mediaLimiter, requireAuth, async (req, res) => {
+router.get('/stream-url/:mediaItemId', mediaLimiter, requireAuth, requireEntitlement, async (req, res) => {
   const item = await mediaItemCache.getOrFetch(req.params.mediaItemId, async () => {
     const { data } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
     return data || null;
@@ -610,7 +611,7 @@ router.get('/stream-url/:mediaItemId', mediaLimiter, requireAuth, async (req, re
  *    at /file/:id (which additionally sets a Content-Disposition:
  *    attachment header so it saves rather than plays inline).
  * ------------------------------------------------------------------ */
-router.get('/download-url/:mediaItemId', mediaLimiter, requireAuth, async (req, res) => {
+router.get('/download-url/:mediaItemId', mediaLimiter, requireAuth, requireEntitlement, async (req, res) => {
   const item = await mediaItemCache.getOrFetch(req.params.mediaItemId, async () => {
     const { data } = await supabase.from('media_items').select('*').eq('id', req.params.mediaItemId).single();
     return data || null;
@@ -684,8 +685,8 @@ async function proxyMedia(req, res, { forceDownload }) {
   }
 }
 
-router.get('/stream/:mediaItemId', mediaLimiter, requireMediaAccess('stream'), (req, res) => proxyMedia(req, res, { forceDownload: false }));
-router.get('/file/:mediaItemId', mediaLimiter, requireMediaAccess('download'), (req, res) => proxyMedia(req, res, { forceDownload: true }));
+router.get('/stream/:mediaItemId', mediaLimiter, requireMediaAccess('stream'), requireEntitlement, (req, res) => proxyMedia(req, res, { forceDownload: false }));
+router.get('/file/:mediaItemId', mediaLimiter, requireMediaAccess('download'), requireEntitlement, (req, res) => proxyMedia(req, res, { forceDownload: true }));
 
 /* ------------------------------------------------------------------
  * 7) RESOLVE MEDIA  (internal only — the Cloudflare audio Worker, not

@@ -49,6 +49,9 @@ function requireMediaAccess(purpose) {
         const payload = jwt.verify(token, process.env.JWT_SECRET);
         if (payload.purpose === purpose && payload.mid === String(req.params.mediaItemId)) {
           req.user = payload;
+          // Minted by stream-url / download-url, which already enforced the
+          // subscription + device checks -- see middleware/entitlement.js.
+          req.viaMediaToken = true;
           return next();
         }
       } catch (e) {
@@ -59,4 +62,15 @@ function requireMediaAccess(purpose) {
   };
 }
 
-module.exports = { requireAuth, requireAdmin, signMediaToken, requireMediaAccess };
+/**
+ * The app login token. [deviceId] binds it to a registered device (claim
+ * "did"); listeners must have one when device enforcement is on, admins never
+ * do. 30 days, as before.
+ */
+function signUserToken(user, deviceId) {
+  const claims = { sub: user.id, email: user.email, role: user.role };
+  if (deviceId) claims.did = deviceId;
+  return jwt.sign(claims, process.env.JWT_SECRET, { expiresIn: '30d' });
+}
+
+module.exports = { requireAuth, requireAdmin, signMediaToken, requireMediaAccess, signUserToken };

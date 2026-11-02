@@ -1,0 +1,87 @@
+import 'dart:convert';
+import 'dart:io';
+import 'package:swarkatha/models/subscription.dart' as L;
+import 'package:adminapp/models/subscription.dart' as A;
+
+int fails = 0;
+void check(String name, bool ok, [Object? detail]) {
+  if (!ok) fails++;
+  print('${ok ? '  ok  ' : '  FAIL'} $name${ok ? '' : '   -> $detail'}');
+}
+
+void main() {
+  final f = jsonDecode(File('/tmp/fixtures/live.json').readAsStringSync()) as Map<String, dynamic>;
+  final now = DateTime.now();
+
+  print('LISTENER APP  <-  GET /api/subscriptions/me (running trial)');
+  final me = f['me_trial'] as Map<String, dynamic>;
+  final sub = L.SubscriptionInfo.fromJson(me['subscription'] as Map<String, dynamic>);
+  final acc = L.AccessInfo.fromJson(me['access'], fetchedAt: now)!;
+  final trial = L.TrialInfo.fromJson(me['trial']);
+  check('status is trial', sub.statusOn(now) == L.SubscriptionStatus.trial, sub.statusOn(now));
+  check('plan = trial, isTrial', sub.isTrial && sub.plan == 'trial');
+  final hrs = sub.remainingHoursOn(now)!;
+  check('about 72h left (71-72)', hrs >= 71 && hrs <= 72, hrs);
+  check('3 days remaining', sub.remainingDaysOn(now) == 3, sub.remainingDaysOn(now));
+  check('server says entitled (trial)', acc.entitled && acc.reason == 'trial', '${acc.entitled} ${acc.reason}');
+  check('validUntil ~ expiresAt', acc.validUntil != null && acc.validUntil!.difference(sub.expiresAt!).inSeconds.abs() < 2);
+  check('device allowed offline right now', acc.allowsOffline(now));
+  check('trial ledger: used, not eligible again', trial.used && !trial.eligible, '${trial.used} ${trial.eligible}');
+  final dev = me['devices'];
+  check('device summary: limit 3, 1 active (the other is blocked, so not counted)', dev is Map && dev['limit'] == 3 && dev['activeCount'] == 1, dev);
+
+  print('LISTENER APP  <-  trial claimed twice');
+  check('second claim -> code trial... / has_subscription with message',
+      f['claim_again']['code'] == 'has_subscription' && (f['claim_again']['error'] as String).isNotEmpty, f['claim_again']);
+
+  print('LISTENER APP  <-  expired trial');
+  final exp = f['expired_trial_me'] as Map<String, dynamic>;
+  final esub = L.SubscriptionInfo.fromJson(exp['subscription'] as Map<String, dynamic>);
+  final eacc = L.AccessInfo.fromJson(exp['access'], fetchedAt: now)!;
+  check('status expired', esub.statusOn(now) == L.SubscriptionStatus.expired, esub.statusOn(now));
+  check('server says not entitled: trial_expired', !eacc.entitled && eacc.reason == 'trial_expired', eacc.reason);
+  check('offline playback refused', !eacc.allowsOffline(now));
+
+  print('LISTENER APP  <-  login');
+  final login = f['login_ok'] as Map<String, dynamic>;
+  check('token + device binding returned', (login['token'] as String).isNotEmpty && login['device']['limit'] == 3);
+  final lim = f['login_limit'] as Map<String, dynamic>;
+  check('limit refusal has code + message + device list',
+      lim['code'] == 'device_limit_reached' && (lim['error'] as String).contains('limit') && (lim['devices'] as List).length == 1, lim);
+
+  print('ADMIN APP  <-  GET /api/subscriptions (dashboard list)');
+  final list = f['admin_list'] as Map<String, dynamic>;
+  final rows = (list['users'] as List).map((e) => A.SubUserRow.fromJson(e as Map<String, dynamic>)).toList();
+  final summary = A.SubSummary.fromJson(list['summary'] as Map<String, dynamic>);
+  final trialRow = rows.firstWhere((r) => r.email.startsWith('fx-trial'));
+  final paidRow = rows.firstWhere((r) => r.email.startsWith('fx-paid'));
+  check('summary parses a trial bucket', summary.forFilter('trial') >= 0 && list['summary'].containsKey('trial'));
+  check('trial row: plan trial + devices 2 of 3 -> counts only active (1 active, 1 blocked)',
+      trialRow.sub.plan == 'trial' && trialRow.deviceLimit == 3 && trialRow.deviceCount == 1, '${trialRow.sub.plan} ${trialRow.deviceLimit}/${trialRow.deviceCount}');
+  check('paid row: 90-day plan, active', paidRow.sub.plan == '90' && paidRow.sub.status == A.SubStatus.active, '${paidRow.sub.plan} ${paidRow.sub.status}');
+
+  print('ADMIN APP  <-  GET /api/subscriptions/:id (detail + history)');
+  final det = A.SubDetail.fromJson(f['admin_detail'] as Map<String, dynamic>);
+  check('trial ledger: used, claimed by listener', det.trial.used && det.trial.firstSource == 'self' && det.trial.usedAt != null, det.trial.firstSource);
+  check('history has trial_claimed', det.history.any((h) => h.action == 'trial_claimed'), det.history.map((h) => h.action).toList());
+  check('detail carries device summary', det.user.deviceLimit == 3);
+
+  print('ADMIN APP  <-  GET /api/admin/users/:id/devices');
+  final dl = A.DeviceList.fromJson(f['admin_devices'] as Map<String, dynamic>);
+  check('limit 3, 1 active, 2 devices listed', dl.limit == 3 && dl.activeCount == 1 && dl.devices.length == 2, '${dl.limit} ${dl.activeCount} ${dl.devices.length}');
+  final blocked = dl.devices.where((d) => d.blocked).toList();
+  final clone = dl.devices.where((d) => d.isCloneEnvironment).toList();
+  check('one blocked device', blocked.length == 1);
+  check('clone/dual-app environment flagged with reason', clone.length == 1 && clone.first.cloneReasons.contains('secondary_user'), clone.map((d) => d.cloneReasons).toList());
+  check('label + last active parsed', dl.devices.every((d) => d.label.contains('Samsung') && d.lastActiveAt != null));
+  check('no identifier hashes leak to the admin app', !jsonEncode(f['admin_devices']).contains('hash'));
+
+  print('ADMIN APP  <-  GET /api/admin/activity');
+  final act = (f['admin_activity']['entries'] as List).map((e) => A.ActivityEntry.fromJson(e as Map<String, dynamic>)).toList();
+  check('device.block logged with who/whom/when',
+      act.any((e) => e.action == 'device.block' && e.adminEmail!.startsWith('fx-admin') && e.targetEmail!.startsWith('fx-trial') && e.createdAt != null),
+      act.map((e) => e.action).toList());
+
+  print('\n${fails == 0 ? 'ALL CONTRACT CHECKS PASSED' : '$fails CHECK(S) FAILED'}');
+  exit(fails == 0 ? 0 : 1);
+}
