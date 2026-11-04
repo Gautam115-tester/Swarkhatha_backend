@@ -89,9 +89,12 @@ and under a per-user lock, decides whether this is a known device:
 
 1. DRM hash matches, or
 2. any known `ANDROID_ID` hash matches, or
-3. hardware signature matches **and** one side was seen in a clone / secondary
-   environment. Two identical phones are *not* merged, because without clone
-   evidence a matching signature proves nothing.
+3. hardware signature matches, **and** one side was seen in a clone / secondary
+   environment, **and** the two DRM ids do not contradict each other. Two
+   identical phones (say two iQOO Neo 7) are *not* merged: without clone
+   evidence a matching signature proves nothing, and if both report a DRM id
+   and the ids differ they are different handsets, even when one runs inside a
+   Dual App.
 
 Otherwise it is a new device: registered if under the limit, refused
 (`device_limit_reached`) if not. A clone that is recognised adds its own
@@ -103,6 +106,14 @@ Otherwise it is a new device: registered if under the limit, refused
   needs hardware attestation (Play Integrity) which needs a Google Cloud
   project and is not included.
 * A factory reset is a new device (admin can remove the old one).
+* **Residual gap:** if a Dual App on a friend's phone of the *same model* cannot
+  read a DRM id (some devices expose none), the server cannot tell it from the
+  registered phone and folds it onto it. If sharing between identical models
+  worries you, set `CLONE_POLICY=block_all`: any Dual App / second user / work
+  profile is then refused outright. The cost is that people who legitimately use
+  their phone's own Dual Apps are refused too.
+* A user can never free a slot themselves (logging out does not), so swapping
+  phones always needs an admin to remove the old device.
 * Some cloner containers spoof everything; set `CLONE_POLICY=block_virtual` to
   refuse the ones that are detectable. The default only de-duplicates, so it
   never locks out someone using the OS's own Dual Apps.

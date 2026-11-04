@@ -195,10 +195,12 @@ $$;
 --   1. DRM hash matches            (device-wide, shared by every Android user/profile)
 --   2. ANDROID_ID hash matches     (survives uninstall / reinstall / clear data)
 --   3. Hardware signature matches AND either side was seen from a secondary
---      user / dual-app / clone environment. This is what folds a Dual App
---      (which gets a different ANDROID_ID) back onto its original device.
---      Without the "secondary" condition, two identical phones would be
---      merged just for having the same model.
+--      user / dual-app / clone environment AND the DRM ids do not contradict
+--      each other. This folds a Dual App (which gets a different ANDROID_ID)
+--      back onto its original device. Without the "secondary" condition two
+--      identical phones would be merged just for having the same model; without
+--      the DRM condition a friend's identical phone running a Dual App would
+--      be mistaken for the registered one.
 --
 -- Returns { result: 'registered' | 'existing' | 'limit_reached' | 'blocked' | 'no_user', ... }
 create or replace function sk_register_device(p_user_id uuid, p_dev jsonb)
@@ -226,7 +228,11 @@ begin
    where user_id = p_user_id
      and ( (v_drm is not null and v_drm = any(drm_hashes))
         or (v_aid is not null and v_aid = any(android_id_hashes))
-        or (v_hw is not null and hw_signature = v_hw and (v_secondary or secondary_env)) )
+        or (v_hw is not null and hw_signature = v_hw and (v_secondary or secondary_env)
+            -- ...but NEVER when both sides report a DRM id and they differ: the DRM
+            -- id is device-wide, so a different one means a different physical
+            -- phone (e.g. a friend's identical model running a Dual App).
+            and (v_drm is null or cardinality(drm_hashes) = 0)) )
    -- If the same physical device somehow matches both a blocked and an active
    -- row, the blocked one wins: blocking can't be dodged through an alias.
    order by (status = 'blocked') desc, last_active_at desc

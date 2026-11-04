@@ -205,6 +205,29 @@ test('a DIFFERENT identical phone (same model, no clone flags) is NOT merged', a
   assert.equal(r.body.code, 'device_limit_reached');
 });
 
+test('same phone, Dual App exposes the SAME device-wide DRM id -> one device', async () => {
+  const u = await mkUser(`dualdrm-${uniq()}@it.test`);
+  const a = await login(u.email, phone('dd1'));
+  const clone = phone('dd1', { androidId: 'dd1-clone-aid', userHandle: 10, secondaryEnv: true, cloneReasons: ['secondary_user'] });
+  const b = await login(u.email, clone); // same hardwareId (DRM), same signature, different ANDROID_ID
+  assert.equal(b.status, 200, JSON.stringify(b.body));
+  assert.equal(jwt.decode(b.body.token).did, jwt.decode(a.body.token).did);
+});
+
+test("BYPASS ATTEMPT: friend's identical phone in a Dual App is NOT mistaken for the registered phone", async () => {
+  const u = await mkUser(`friend-${uniq()}@it.test`);
+  assert.equal((await login(u.email, phone('own1'))).status, 200); // limit 1 used by the owner's phone
+  // Same make/model/RAM => same hardware signature; it runs in a Dual App (secondary env);
+  // but it is a different handset, so its DRM id and ANDROID_ID differ.
+  const friend = phone('own1', {
+    androidId: 'friends-phone-aid', hardwareId: hex('friends-phone-drm'),
+    userHandle: 10, secondaryEnv: true, cloneReasons: ['secondary_user'],
+  });
+  const r = await login(u.email, friend);
+  assert.equal(r.status, 403);
+  assert.equal(r.body.code, 'device_limit_reached');
+});
+
 test('clone first, original later: still one device', async () => {
   const u = await mkUser(`cloneFirst-${uniq()}@it.test`);
   const clone = phone('c9', { androidId: 'only-clone', hardwareId: undefined, userHandle: 95, secondaryEnv: true, cloneReasons: ['secondary_user'] });
