@@ -188,3 +188,7 @@ Added on top of the manual subscriptions above. Still no payments. Run
 device-identification limits, enforcement flags (`SUBSCRIPTION_ENFORCEMENT`,
 `DEVICE_ENFORCEMENT`) and the API.
 
+
+## Music classification
+
+Every music upload is classified automatically (genre, mood, vocal, language, version, ...) by a background worker, and a resumable backfill classifies the existing library. See [CLASSIFICATION.md](CLASSIFICATION.md) for setup, commands, the admin API and the guarantees.

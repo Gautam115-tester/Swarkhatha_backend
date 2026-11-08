@@ -6,6 +6,7 @@ const { decrypt } = require('../lib/crypto');
 const drime = require('../lib/drime');
 const mediaItemCache = require('../lib/mediaItemCache');
 const autoCategorize = require('../lib/autoCategorize');
+const classificationHooks = require('../lib/classification/hooks');
 const multer = require('multer');
 const { coverUrl } = require('../lib/coverUrl');
 const artworkLib = require('../lib/artwork');
@@ -268,7 +269,14 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
   // an LLM call must never be why an upload takes longer or fails, and
   // autoCategorizeIfMissing is itself best-effort (a genuine "no confident
   // match" just leaves the row as-is, same as if this were never called).
-  if (!categoryText) {
+  //
+  // Music goes through the multi-label classification engine (lib/classification): the row
+  // above is already saved, so this only enqueues a durable job -- it cannot slow down or fail
+  // the upload, and the engine itself fills an EMPTY legacy category/content_label_id. Audio
+  // stories (and music, if CLASSIFICATION_ENABLED=off) keep the original Groq categorizer.
+  if (type === 'music' && classificationHooks.isEnabled()) {
+    classificationHooks.enqueueNewMusic(data.id);
+  } else if (!categoryText) {
     autoCategorize.autoCategorizeIfMissing(data.id).catch((e) =>
       console.error(`[media create] auto-categorize failed for ${data.id} (continuing):`, e.message)
     );

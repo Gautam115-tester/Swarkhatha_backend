@@ -17,6 +17,7 @@ const playlistsRoutes = require('./routes/playlists');
 const subscriptionsRoutes = require('./routes/subscriptions');
 const devicesRoutes = require('./routes/devices');
 const adminUsersRoutes = require('./routes/adminUsers');
+const classificationRoutes = require('./routes/classification');
 const { deviceGate } = require('./middleware/entitlement');
 
 const app = express();
@@ -51,6 +52,10 @@ app.use('/api/stats', deviceGate, statsRoutes);
 app.use('/api/lyrics', deviceGate, lyricsRoutes);
 app.use('/api/playlists', deviceGate, playlistsRoutes);
 app.use('/api/subscriptions', deviceGate, subscriptionsRoutes);
+// Automatic music classification (lib/classification, CLASSIFICATION.md). The cron route uses a shared
+// secret instead of a JWT, so it sits outside the device gate; every other route is gated like the rest.
+app.use('/api/classification/cron', classificationRoutes.cron);
+app.use('/api/classification', deviceGate, classificationRoutes);
 
 // --- JSON 404 handler ---------------------------------------------------
 // Any request that doesn't match a route above used to fall through to
@@ -93,4 +98,16 @@ app.listen(PORT, () => {
   // when a listener opens the app and by POST /api/subscriptions/cron/run, so
   // a sleeping Render instance can't cause a missed notification.
   require('./lib/subscriptionNotifier').startScheduler();
+  // Music classification worker (durable Postgres queue; see CLASSIFICATION.md). Off with
+  // CLASSIFICATION_ENABLED=off or CLASSIFICATION_WORKER_ENABLED=off (e.g. when a separate
+  // `node scripts/classification-cli.js worker` process does the work).
+  if (require('./lib/classification/hooks').isEnabled()) {
+    try {
+      const classification = require('./lib/classification/service').getService();
+      classification.startWorker();
+      const shutdown = () => classification.stopWorker().finally(() => process.exit(0));
+      process.once('SIGTERM', shutdown);
+      process.once('SIGINT', shutdown);
+    } catch (e) { console.error('[classification] worker failed to start (uploads are unaffected):', e.message); }
+  }
 });
