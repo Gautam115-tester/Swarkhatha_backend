@@ -1,0 +1,194 @@
+# SwarKatha Backend (Phase 1)
+
+Node.js/Express API that sits between the Flutter app and its media storage. It exists
+specifically so that:
+- Storage credentials (Drime access tokens) never touch the app or the device.
+- The app can ask "which account has room for this file?" without holding any storage
+  credentials itself.
+- Streaming/download URLs are resolved on demand, short-lived, and never expose the
+  underlying Drime credentials to the client.
+
+Storage runs on **Drime Cloud only**: connect as many Drime accounts as you need, tag
+each one for `music`, `audio_story`, `both`, or `image`, and the backend routes
+uploads, streaming and downloads to the right one. `image`-purpose accounts hold
+cover art (album art + audio-story covers) — kept separate from `both` (which means
+"music & audio_story") so the public cover-image route below can trust an account's
+purpose as its whole authorization check. See `supabase/migration_image_storage_drime.sql`
+and `scripts/migrate-cover-images-to-drime.js` if you're moving covers off an older
+Supabase-Storage-backed deployment.
+
+> Drime's file-bytes endpoint always requires that account's access token on every
+> request — there's no MediaFire-style "direct, credential-free" link type. So instead
+> of handing the app a raw Drime URL, `GET /api/storage/stream-url/:id` and
+> `/download-url/:id` mint a short-lived (default 15 min), single-purpose signed URL
+> pointing back at **this backend's own** `/api/storage/stream/:id` and `/file/:id`
+> routes. Those routes fetch the bytes from Drime server-side (keeping the account's
+> token private) and pipe them straight through to the app, forwarding `Range` so
+> playback can seek/scrub normally.
+
+## Endpoints
+
+| Method | Path | Who | Purpose |
+|---|---|---|---|
+| POST | `/api/auth/signup` | public | listener signup |
+| POST | `/api/auth/login` | public | login, returns app JWT |
+| POST | `/api/storage/accounts` | admin | connect a Drime account |
+| GET | `/api/storage/accounts` | admin | list all storage accounts + live free space |
+| PATCH | `/api/storage/accounts/:id` | admin | rename/re-tag an account |
+| POST | `/api/storage/upload` | admin | uploads a file; auto-picks or uses `accountId` |
+| GET | `/api/storage/stream-url/:mediaItemId` | any logged-in user | resolves a short-lived playback URL |
+| GET | `/api/storage/download-url/:mediaItemId` | any logged-in user | resolves a short-lived offline-download URL |
+| GET | `/api/storage/stream/:mediaItemId` | signed URL or logged-in user | proxies the actual playback bytes from Drime |
+| GET | `/api/storage/file/:mediaItemId` | signed URL or logged-in user | proxies the actual download bytes from Drime (forces `Content-Disposition: attachment`) |
+| POST | `/api/storage/upload-image` | admin | uploads a cover image; auto-picks (or uses `accountId` for) an `image`-purpose account |
+| GET | `/api/storage/cover/:accountId/:hash` | public, no auth | proxies cover-image bytes from Drime — safe because `accountId` must be `purpose: 'image'` |
+| GET/POST/DELETE | `/api/media` | mixed | catalog CRUD, favorites, resume progress |
+| GET | `/api/subscriptions/me` | any logged-in user | own subscription (status, dates, remaining days) + unread count |
+| GET / POST | `/api/subscriptions/me/notifications[/read]` | any logged-in user | own expiry-reminder inbox / mark read |
+| GET | `/api/subscriptions?status=&q=&limit=&offset=` | admin | listener list with subscription status + summary counts |
+| GET / PATCH / DELETE | `/api/subscriptions/:userId` | admin | detail + history / modify / remove |
+| POST | `/api/subscriptions/:userId/assign` · `/renew` · `/extend` | admin | new term (plan + start date) / add days |
+| POST | `/api/subscriptions/cron/run` | `x-cron-secret` | run the expiry-reminder sweep (for an external scheduler) |
+
+## Adding a storage account (admin flow)
+
+Drime has no app-wide credentials to register up front — each account is connected
+purely by generating a personal access token from that Drime account's own dashboard:
+
+1. Log in to [Drime Cloud](https://app.drime.cloud).
+2. Go to **Account Settings → Developers → Create a token**.
+3. Name it, click **Create**, and copy the token.
+
+Then call `POST /api/storage/accounts` once per Drime account:
+
+```bash
+curl -X POST https://<service>.onrender.com/api/storage/accounts \
+  -H "Authorization: Bearer <admin JWT>" -H "Content-Type: application/json" \
+  -d '{
+    "accessToken": "<the personal access token from step 3>",
+    "workspaceId": 0,
+    "purpose": "both",
+    "label": "Drime - main"
+  }'
+```
+
+`workspaceId` defaults to `0` (personal workspace); pass a specific workspace id if
+you want uploads to land in a shared Drime workspace instead. `folderId` is optional
+and scopes every upload from this account into one Drime folder.
+
+Credentials are encrypted (AES-256-GCM) before being stored in `storage_accounts`; the
+app never sees them.
+
+## Space-aware upload
+
+`POST /api/storage/upload` (multipart form: `file`, `mediaType`, optional `accountId`,
+optional `folder`):
+- If `accountId` is given, it uploads straight to that account (after checking its
+  `purpose` matches `mediaType`).
+- If omitted, it auto-picks the best-fitting account by most recently known free
+  space (Drime reports real used/available bytes on every `GET /user/space-usage`
+  call).
+- Returns `507 Insufficient Storage` if nothing matches.
+- Files under 5MB go through Drime's simple presigned-upload flow; anything at or
+  above that automatically uses Drime's multipart upload flow (10MB chunks) instead —
+  audio-story episodes in particular routinely exceed the 5MB simple-upload
+  threshold.
+- The response includes `storageFileId` (Drime's file entry id, used to delete the
+  file later) and `storageHash` (used to stream/download the file's bytes) — **both**
+  need to be passed to `POST /api/media` when registering the catalog entry.
+
+To let the admin **choose** rather than auto-pick, call `GET /api/storage/accounts`
+first, show the list with free space, then pass the chosen `accountId` into `/upload`.
+
+## Setup
+
+```bash
+npm install
+cp .env.example .env   # fill in real values
+```
+
+Generate `TOKEN_ENC_KEY` (32-byte hex key for AES-256-GCM):
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+Run the schema in `supabase/schema.sql` via the Supabase SQL editor, then
+`supabase/migration_labels_albums.sql`. If you're upgrading an existing deployment
+that had MediaFire storage accounts connected, also run
+`supabase/migration_mediafire_only.sql` (if you hadn't already) and then
+`supabase/migration_drime_only.sql` last.
+
+Optional env vars (see `.env.example`):
+- `STORAGE_REFRESH_INTERVAL_MS` (default `30000`) — how often each Drime account's
+  disk usage is checked **while an admin app is open** (connected to
+  `GET /api/storage/accounts/live`, or polling `GET /api/storage/accounts`).
+- `STORAGE_BACKGROUND_INTERVAL_MS` (default `1500000`, 25 min) — how often it is checked
+  **while no admin app is open**. This is an in-process timer, so it only runs while the
+  instance is awake; on Render's free tier add the external scheduler below.
+- `STORAGE_CRON_SECRET` — enables `POST /api/storage/accounts/background-check`
+  (header `x-cron-secret`). Point a scheduler at it every ~25 min — see
+  `cdn-worker/storage-check-cron-worker.js`. Unset = the route returns 404.
+- `STREAM_TOKEN_TTL_SECONDS` (default `900`) — how long the signed stream/download
+  URLs returned by `stream-url`/`download-url` stay valid before the app needs to ask
+  for a fresh one.
+- `DRIME_API_BASE` — override the Drime API base URL (rarely needed).
+
+```bash
+npm run dev   # local dev with nodemon
+npm start     # production
+```
+
+See `DEPLOYMENT.md` for deploying this to Render alongside the storage account setup
+steps. If cover images are loading slowly, see `IMAGE_PERFORMANCE.md` — a set of
+free, no-new-cost changes (server-side caching + an optional CDN edge cache) that
+fix that without moving off Supabase/Render/Drime.
+
+## What's NOT in this phase yet
+- The Flutter app itself (player UI, admin upload screen, equalizer wiring)
+- Full top-level README tying frontend + backend together
+
+These come next — say the word and I'll build the Flutter side, wiring your existing
+`EqualizerManager.kt` / `MainActivity.kt` in for the music player's equalizer (and
+correctly leaving it out of the audio story player).
+
+
+## Manual subscriptions
+
+Admins assign subscriptions by hand — there are **no payments, billing or auto-renewals**.
+Run `supabase/migration_subscriptions.sql` once (after the other migrations).
+
+- **Plans:** 30 / 90 / 180 / 365 days or Lifetime. `end date = start date + duration`
+  (30 days from 1 Jan → 31 Jan). It stays valid through the end of that day and shows
+  *Expired* from the next day. Remaining days = end date − today (0 on the last day).
+- **Status** (Active, Expiring Soon ≤ 7 days, Expired, Lifetime, plus Not started / None)
+  and remaining days are **never stored** — they are derived from the dates on every read
+  (`lib/subscription.js`), so they can't go stale and the admin and listener apps always agree.
+- **Extend** adds days to the current end date (or starts a new term today if already expired).
+  **Renew / Assign** starts a new term from a chosen plan + start date. **Modify** edits plan,
+  start/end dates or the note. Every action is recorded in `subscription_history`.
+- **Reminders** at 7, 3 and 1 day(s) before expiry and on expiry go to the listener's in-app inbox
+  and by email (SMTP). Each is created at most once per term (`dedupe_key`), and a new set starts
+  when the end date changes. They are generated (a) when the listener opens the app, (b) hourly
+  while the instance is awake, and (c) by `POST /api/subscriptions/cron/run` — point an external
+  scheduler at it daily (same idea as `cdn-worker/storage-check-cron-worker.js`):
+
+  ```bash
+  curl -X POST https://<service>.onrender.com/api/subscriptions/cron/run -H "x-cron-secret: $SUBSCRIPTION_CRON_SECRET"
+  ```
+- `SUBSCRIPTION_TZ` (default `Asia/Kolkata`) decides which calendar day is "today".
+- Tests: `npm test` (date/status logic + the routes against an in-memory fake database).
+
+---
+
+## Free trial, device limits and enforcement
+
+Added on top of the manual subscriptions above. Still no payments. Run
+`supabase/migration_trials_devices.sql`, then read
+**[SUBSCRIPTIONS_TRIALS_DEVICES.md](SUBSCRIPTIONS_TRIALS_DEVICES.md)** for the rollout order,
+device-identification limits, enforcement flags (`SUBSCRIPTION_ENFORCEMENT`,
+`DEVICE_ENFORCEMENT`) and the API.
+
+
+## Music classification
+
+Every music upload is classified automatically (genre, mood, vocal, language, version, ...) by a background worker, and a resumable backfill classifies the existing library. See [CLASSIFICATION.md](CLASSIFICATION.md) for setup, commands, the admin API and the guarantees.
