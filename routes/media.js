@@ -4,11 +4,18 @@ const supabase = require('../lib/supabaseClient');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { decrypt } = require('../lib/crypto');
 const drime = require('../lib/drime');
-const coverImageStorage = require('../lib/coverImageStorage');
 const mediaItemCache = require('../lib/mediaItemCache');
 const autoCategorize = require('../lib/autoCategorize');
+const multer = require('multer');
+const { coverUrl } = require('../lib/coverUrl');
+const artworkLib = require('../lib/artwork');
+const { sanitizeSegment, parseReleaseYear } = artworkLib;
+// Centralized artwork: albums/story_series own their ONE image, everything else
+// reaches it through album_id / story_series_id. See lib/artwork.js.
+const artwork = artworkLib.getDefault();
 
 const router = express.Router();
+const artworkUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB cap, same as /upload-image
 
 // Supabase/PostgREST caps every single request at the project's max-rows
 // setting (1000 by default) regardless of how the query is built — there
@@ -62,151 +69,67 @@ router.get('/', requireAuth, async (req, res) => {
 
   try {
     const data = await fetchAllRows(buildQuery);
-    res.json({ items: data });
+    // Artwork always comes from the parent album/series (see lib/artwork.js),
+    // so every track of an album — and every episode of a series — carries the
+    // exact same URL no matter what its own legacy cover column says.
+    res.json({ items: await artwork.applyArtwork(data) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-/* ------------------------------------------------------------------
- * Filename/title sanitizer for the story-episode composition rule.
- * Strips underscores (the field separator) and characters that are
- * unsafe as a storage filename (on Drime), and
- * collapses whitespace. Applied to every segment independently so a
- * story title containing "_" can't be mistaken for an extra field
- * when the parts are later split.
- * ------------------------------------------------------------------ */
-function sanitizeSegment(value) {
-  return String(value || '')
-    .replace(/_/g, ' ')
-    .replace(/[\\/:*?"<>|]/g, '')
-    .trim()
-    .replace(/\s+/g, ' ');
-}
-
 // Composes "StoryTitle_EpNumber_EpTitle" (or "StoryTitle_EpNumber" when
 // no episode title is given — episode title is optional per spec).
+// (sanitizeSegment lives in lib/artwork.js so identity keys and stored names agree.)
 function composeEpisodeTitle(storyTitle, epNumber, epTitle) {
   const parts = [sanitizeSegment(storyTitle), String(epNumber)];
   if (epTitle && sanitizeSegment(epTitle)) parts.push(sanitizeSegment(epTitle));
   return parts.join('_');
 }
 
-// Find-or-create an album row for a music upload. Matches on
-// (name, artist) so re-uploading tracks from the same album reuses
-// the same album_id instead of creating a duplicate; track_count is
-// incremented server-side so it never drifts from actual inserts.
-async function findOrCreateAlbum({ name, artist, coverImageUrl, coverStorageAccountId, coverStorageFileId, coverStorageHash }) {
-  const albumName = sanitizeSegment(name) || 'Unknown Album';
-  const albumArtist = artist ? sanitizeSegment(artist) : null;
-
-  let findQuery = supabase.from('albums').select('*').eq('name', albumName);
-  // .eq('artist', null) never matches in Postgres (NULL <> NULL) — use .is() for the null case
-  findQuery = albumArtist ? findQuery.eq('artist', albumArtist) : findQuery.is('artist', null);
-  const { data: existing, error: findErr } = await findQuery.maybeSingle();
-  if (findErr) throw new Error(findErr.message);
-
-  if (existing) {
-    const update = { track_count: existing.track_count + 1 };
-    // Albums are first-cover-wins (unlike stories below) — an album's
-    // cover is never replaced by a later track's upload, so there's no
-    // old file to delete here, just identifiers to fill in if this is
-    // the album's very first cover.
-    if (!existing.cover_image_url && coverImageUrl) {
-      update.cover_image_url = coverImageUrl;
-      update.image_storage_account_id = coverStorageAccountId || null;
-      update.image_storage_file_id = coverStorageFileId || null;
-      update.image_storage_hash = coverStorageHash || null;
-    }
-    const { data: updated, error: updErr } = await supabase
-      .from('albums').update(update).eq('id', existing.id).select().single();
-    if (updErr) throw new Error(updErr.message);
-    return updated;
-  }
-
-  const { data: created, error: createErr } = await supabase
-    .from('albums')
-    .insert({
-      name: albumName, artist: albumArtist, cover_image_url: coverImageUrl, track_count: 1,
-      image_storage_account_id: coverStorageAccountId || null,
-      image_storage_file_id: coverStorageFileId || null,
-      image_storage_hash: coverStorageHash || null
-    })
-    .select().single();
-  if (createErr) throw new Error(createErr.message);
-  return created;
+function albumJson(a) {
+  return {
+    id: a.id,
+    name: a.name,
+    artist: a.artist,
+    releaseYear: a.release_year ?? null,
+    coverImageUrl: a.cover_image_url || null,
+    hasArtwork: Boolean(a.cover_image_url),
+    trackCount: a.track_count ?? 0
+  };
 }
 
-// Find-or-create a story_series row for an audio_story upload — the
-// audio-story equivalent of findOrCreateAlbum() above. Matches on title
-// alone (a story keeps one series row across episodes even if a later
-// episode credits a different narrator or a new cover gets set), and
-// episode_count is incremented server-side so it never drifts, exactly
-// like albums.track_count. Requires migration_story_series.sql to have
-// been run — if the story_series table doesn't exist yet, this throws
-// and the caller surfaces that as a 500 with the real Postgres error.
-async function findOrCreateStorySeries({ title, narrator, coverImageUrl, coverStorageAccountId, coverStorageFileId, coverStorageHash }) {
-  const seriesTitle = sanitizeSegment(title);
-
-  const { data: existing, error: findErr } = await supabase
-    .from('story_series').select('*').eq('title', seriesTitle).maybeSingle();
-  if (findErr) throw new Error(findErr.message);
-
-  if (existing) {
-    const update = { episode_count: existing.episode_count + 1 };
-    // Unlike albums (first cover wins, see findOrCreateAlbum), a
-    // story's cover can be replaced any time the admin manually
-    // uploads a fresh one — the caller in POST /api/media then
-    // propagates it to every existing episode of the series too.
-    const isReplacingCover = Boolean(coverImageUrl) && existing.cover_image_url !== coverImageUrl;
-    if (coverImageUrl) {
-      update.cover_image_url = coverImageUrl;
-      update.image_storage_account_id = coverStorageAccountId || null;
-      update.image_storage_file_id = coverStorageFileId || null;
-      update.image_storage_hash = coverStorageHash || null;
-    }
-    if (!existing.narrator && narrator) update.narrator = narrator;
-    const { data: updated, error: updErr } = await supabase
-      .from('story_series').update(update).eq('id', existing.id).select().single();
-    if (updErr) throw new Error(updErr.message);
-
-    // Clean up the file this series' cover used to point at — only
-    // after the row above is safely repointed at the new one, and only
-    // best-effort: an old row predating these columns (existing.
-    // image_storage_file_id null) or a Drime hiccup here must never
-    // fail the actual upload the admin is waiting on.
-    if (isReplacingCover && existing.image_storage_account_id && existing.image_storage_file_id) {
-      coverImageStorage
-        .deleteImage({ accountId: existing.image_storage_account_id, storageFileId: existing.image_storage_file_id })
-        .catch((e) => console.error('[media create] failed to delete replaced story cover (continuing):', e.response?.data?.message || e.message));
-    }
-    return updated;
-  }
-
-  const { data: created, error: createErr } = await supabase
-    .from('story_series')
-    .insert({
-      title: seriesTitle, narrator: narrator || null, cover_image_url: coverImageUrl || null, episode_count: 1,
-      image_storage_account_id: coverStorageAccountId || null,
-      image_storage_file_id: coverStorageFileId || null,
-      image_storage_hash: coverStorageHash || null
-    })
-    .select().single();
-  if (createErr) throw new Error(createErr.message);
-  return created;
+function seriesJson(s) {
+  return {
+    id: s.id,
+    storyTitle: s.title,
+    narrator: s.narrator,
+    coverImageUrl: s.cover_image_url || null,
+    hasArtwork: Boolean(s.cover_image_url),
+    episodeCount: s.episode_count ?? 0
+  };
 }
 
 // Admin: register metadata for a file already uploaded via /api/storage/upload.
-// type = 'music'        -> album is auto-created/matched from albumOrSeries + artistOrNarrator.
-// type = 'audio_story'  -> title is composed as StoryTitle_EpNumber_EpTitle server-side,
-//                          so the stored title always matches the required naming rule
-//                          regardless of what the client sends in `title`.
+// type = 'music'        -> album is resolved by (name + release year) — see
+//                          lib/artwork.js ensureAlbum — or by an explicit `albumId`
+//                          the admin app got from POST /albums/resolve.
+// type = 'audio_story'  -> series is resolved by title (the text before " Ep "), or
+//                          by an explicit `storySeriesId`; the episode title is
+//                          composed as StoryTitle_EpNumber_EpTitle server-side.
+//
+// Artwork is NEVER stored per track/episode: the item's cover_image_url is a
+// mirror of its parent album/series artwork (the API also resolves it through the
+// parent on every read). New clients upload artwork through
+// PUT /albums/:id/artwork or PUT /stories/:id/artwork; the cover* fields below
+// are only honoured for older admin builds that still upload first.
 router.post('/', requireAuth, requireAdmin, async (req, res) => {
   const {
     type, title, artistOrNarrator, albumOrSeries, coverImageUrl, durationSeconds,
     fileSizeBytes, storageProvider, storageAccountId, storageFileId, storageHash, storagePath, contentLabelId,
     chapterNumber, storyTitle, episodeTitle,
-    coverStorageAccountId, coverStorageFileId, coverStorageHash
+    coverStorageAccountId, coverStorageFileId, coverStorageHash,
+    releaseYear, albumId, storySeriesId
   } = req.body;
 
   if (!type || !storageProvider || !storageAccountId || !storageFileId || !storageHash || !storagePath) {
@@ -237,7 +160,7 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
   const insertRow = {
     type,
     artist_or_narrator: artistOrNarrator,
-    cover_image_url: coverImageUrl,
+    cover_image_url: null, // filled from the parent album/series below — never from the request
     duration_seconds: durationSeconds,
     file_size_bytes: fileSizeBytes,
     storage_provider: storageProvider,
@@ -250,36 +173,41 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
     uploaded_by: req.user.sub
   };
 
+  let parentKind; // 'album' | 'series'
+  let parentId;
+
   if (type === 'music') {
     if (!title) return res.status(400).json({ error: 'title is required for music' });
     try {
-      const album = await findOrCreateAlbum({
-        name: albumOrSeries, artist: artistOrNarrator, coverImageUrl,
-        coverStorageAccountId, coverStorageFileId, coverStorageHash
-      });
+      let album = albumId ? await artwork.getAlbum(albumId) : null;
+      if (albumId && !album) return res.status(400).json({ error: 'albumId does not match an existing album' });
+      if (!album) {
+        album = await artwork.ensureAlbum({ name: albumOrSeries, artist: artistOrNarrator, releaseYear });
+      }
+
+      // Older admin builds upload a cover for EVERY track before registering.
+      // The album is the only owner of artwork, so: adopt the file if the album
+      // has none yet, otherwise discard the redundant upload from Drime (only
+      // if nothing references it — the same file legitimately comes back when
+      // a client re-sends the album's own cover).
+      if (coverImageUrl) {
+        if (!album.cover_image_url) {
+          const adopted = await artwork.adoptAlbumArtworkIfMissing({
+            albumId: album.id, url: coverImageUrl,
+            accountId: coverStorageAccountId, storageFileId: coverStorageFileId, storageHash: coverStorageHash
+          });
+          if (adopted.album) album = adopted.album;
+        } else if (album.cover_image_url !== coverImageUrl && coverStorageFileId) {
+          await artwork.discardRedundantUpload({ accountId: coverStorageAccountId, storageFileId: coverStorageFileId });
+        }
+      }
+
       insertRow.title = title;
       insertRow.album_or_series = album.name;
       insertRow.album_id = album.id;
-      // Album art is shared across every track in the album: once the
-      // album has a cover_image_url (set by this upload or an earlier
-      // one), every track uses that same image rather than whatever
-      // this particular upload individually sent. Also backfill any
-      // earlier tracks of this album that were inserted before a cover
-      // existed, so the whole album is consistent going forward.
-      insertRow.cover_image_url = album.cover_image_url || coverImageUrl || null;
-      if (album.cover_image_url) {
-        const { data: backfilled, error: backfillErr } = await supabase.from('media_items')
-          .update({ cover_image_url: album.cover_image_url })
-          .eq('album_id', album.id)
-          .is('cover_image_url', null)
-          .select('id');
-        if (backfillErr) console.error('[media create] album cover backfill failed (continuing):', backfillErr.message);
-        // Bulk updates like this bypass the single-id DELETE invalidation
-        // in mediaItemCache — invalidate every row actually touched so a
-        // long-TTL cache (see lib/mediaItemCache.js) can't keep serving
-        // the old (null) cover_image_url for up to TTL_MS.
-        else if (backfilled) backfilled.forEach((row) => mediaItemCache.invalidate(row.id));
-      }
+      insertRow.cover_image_url = album.cover_image_url || null;
+      parentKind = 'album';
+      parentId = album.id;
     } catch (e) {
       return res.status(500).json({ error: 'Album lookup/create failed: ' + e.message });
     }
@@ -290,40 +218,49 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'chapterNumber (episode number) is required for audio_story' });
     }
     try {
-      const series = await findOrCreateStorySeries({
-        title: storyTitle, narrator: artistOrNarrator, coverImageUrl,
-        coverStorageAccountId, coverStorageFileId, coverStorageHash
-      });
+      let series = storySeriesId ? await artwork.getSeries(storySeriesId) : null;
+      if (storySeriesId && !series) return res.status(400).json({ error: 'storySeriesId does not match an existing series' });
+      if (!series) {
+        series = await artwork.ensureSeries({ title: storyTitle, narrator: artistOrNarrator });
+      }
+
+      // Older admin builds upload the admin-picked series cover first and send it
+      // with the first episode. A series has exactly one image, so it replaces the
+      // old one (and the old file is deleted once nothing references it).
+      if (coverImageUrl) {
+        const updated = await artwork.setSeriesArtworkFromUploaded({
+          seriesId: series.id, url: coverImageUrl,
+          accountId: coverStorageAccountId, storageFileId: coverStorageFileId, storageHash: coverStorageHash
+        });
+        if (updated) series = updated;
+      }
+
       insertRow.story_series_id = series.id;
       insertRow.cover_image_url = series.cover_image_url || null;
-      // If the admin uploaded a fresh cover on this request, it's now
-      // the series' cover (findOrCreateStorySeries already saved it on
-      // the series row above) — push it onto every episode already in
-      // this series too, so a manual re-cover takes effect everywhere
-      // immediately, not just for episodes uploaded from now on.
-      if (coverImageUrl) {
-        const { data: propagated, error: propErr } = await supabase.from('media_items')
-          .update({ cover_image_url: coverImageUrl })
-          .eq('story_series_id', series.id)
-          .select('id');
-        if (propErr) console.error('[media create] story cover propagation failed (continuing):', propErr.message);
-        // Same reasoning as the album backfill above — this can touch
-        // many existing episodes at once, so each affected id needs an
-        // explicit invalidate() rather than waiting out the cache TTL.
-        else if (propagated) propagated.forEach((row) => mediaItemCache.invalidate(row.id));
-      }
+      insertRow.title = composeEpisodeTitle(series.title, chapterNumber, episodeTitle);
+      insertRow.story_title = series.title;
+      insertRow.episode_title = episodeTitle ? sanitizeSegment(episodeTitle) : null;
+      insertRow.album_or_series = series.title; // series grouping = story title (legacy listener app)
+      insertRow.chapter_number = Number(chapterNumber);
+      parentKind = 'series';
+      parentId = series.id;
     } catch (e) {
       return res.status(500).json({ error: 'Story series lookup/create failed: ' + e.message });
     }
-    insertRow.title = composeEpisodeTitle(storyTitle, chapterNumber, episodeTitle);
-    insertRow.story_title = sanitizeSegment(storyTitle);
-    insertRow.episode_title = episodeTitle ? sanitizeSegment(episodeTitle) : null;
-    insertRow.album_or_series = sanitizeSegment(storyTitle); // series grouping = story title (legacy listener app)
-    insertRow.chapter_number = Number(chapterNumber);
   }
 
   const { data, error } = await supabase.from('media_items').insert(insertRow).select().single();
   if (error) return res.status(500).json({ error: error.message });
+
+  // Counters are recomputed from the rows (never read-modify-write), so
+  // simultaneous uploads can't make them drift.
+  try {
+    if (parentKind === 'album') await artwork.recountAlbum(parentId);
+    else await artwork.recountSeries(parentId);
+  } catch (e) {
+    console.error('[media create] count refresh failed (continuing):', e.message);
+  }
+
   res.json({ item: data });
 
   // Fire-and-forget, AFTER responding: only when the admin didn't pick a
@@ -335,6 +272,93 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
     autoCategorize.autoCategorizeIfMissing(data.id).catch((e) =>
       console.error(`[media create] auto-categorize failed for ${data.id} (continuing):`, e.message)
     );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Artwork endpoints (admin). The two-step flow for new admin builds:
+//   1) POST /albums/resolve  (or /stories/resolve) -> find-or-create the parent,
+//      tells the client whether it already has artwork.
+//   2) Only if it has none: PUT /albums/:id/artwork (or /stories/:id/artwork)
+//      with the image bytes. The server decides under a lock; for an album that
+//      already has artwork the bytes are dropped and Drime is never touched.
+//   3) POST / with albumId / storySeriesId.
+// ---------------------------------------------------------------------------
+
+router.post('/albums/resolve', requireAuth, requireAdmin, async (req, res) => {
+  const { name, artist, releaseYear } = req.body;
+  try {
+    const album = await artwork.ensureAlbum({ name, artist, releaseYear });
+    res.json({ album: albumJson(album) });
+  } catch (e) {
+    res.status(500).json({ error: 'Album lookup/create failed: ' + e.message });
+  }
+});
+
+router.put('/albums/:id/artwork', requireAuth, requireAdmin, artworkUpload.single('image'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No image provided' });
+  try {
+    const { album, uploaded } = await artwork.setAlbumArtworkIfMissing({
+      albumId: req.params.id,
+      buffer: req.file.buffer,
+      urlFor: (up) => coverUrl(req, up)
+    });
+    if (!album) return res.status(404).json({ error: 'Album not found' });
+    res.json({ album: albumJson(album), uploaded });
+  } catch (e) {
+    res.status(500).json({ error: 'Album artwork upload failed: ' + e.message });
+  }
+});
+
+// Fix an album's identity (typically: set the release year on a legacy album, or
+// correct the name). Never merges: if the new name+year belongs to another album
+// the request is refused with 409 and the conflicting id.
+router.patch('/albums/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { name, releaseYear, artist } = req.body;
+  try {
+    const result = await artwork.updateAlbumIdentity(req.params.id, { name, releaseYear, artist });
+    if (result.notFound) return res.status(404).json({ error: 'Album not found' });
+    if (result.conflict) {
+      return res.status(409).json({
+        error: 'Another album with this name and release year already exists.',
+        conflictAlbumId: result.conflict.id
+      });
+    }
+    // Keep the legacy text column on the tracks in step with a rename.
+    if (name !== undefined) {
+      const { data: renamed } = await supabase.from('media_items')
+        .update({ album_or_series: result.album.name }).eq('album_id', result.album.id).select('id');
+      (renamed || []).forEach((row) => mediaItemCache.invalidate(row.id));
+    }
+    res.json({ album: albumJson(result.album) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/stories/resolve', requireAuth, requireAdmin, async (req, res) => {
+  const { title, narrator } = req.body;
+  if (!title || !String(title).trim()) return res.status(400).json({ error: 'title is required' });
+  try {
+    const series = await artwork.ensureSeries({ title, narrator });
+    res.json({ series: seriesJson(series) });
+  } catch (e) {
+    res.status(500).json({ error: 'Story series lookup/create failed: ' + e.message });
+  }
+});
+
+router.put('/stories/:id/artwork', requireAuth, requireAdmin, artworkUpload.single('image'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No image provided' });
+  try {
+    const { series, uploaded } = await artwork.setSeriesArtwork({
+      seriesId: req.params.id,
+      buffer: req.file.buffer,
+      urlFor: (up) => coverUrl(req, up)
+    });
+    if (!series) return res.status(404).json({ error: 'Story series not found' });
+    res.json({ series: seriesJson(series), uploaded });
+  } catch (e) {
+    res.status(500).json({ error: 'Series artwork upload failed: ' + e.message });
   }
 });
 
@@ -374,7 +398,11 @@ router.get('/backfill-categories/status', requireAuth, requireAdmin, async (req,
 // List albums (music) — used by the admin app to show existing albums,
 // and by the listener app for an album-browse view if it wants one later.
 router.get('/albums', requireAuth, async (req, res) => {
-  const { data, error } = await supabase.from('albums').select('*').order('name');
+  // Albums with no tracks (e.g. created by /albums/resolve and then abandoned
+  // when an upload failed) are hidden unless includeEmpty=1.
+  let q = supabase.from('albums').select('*').order('name').order('release_year', { ascending: false });
+  if (req.query.includeEmpty !== '1') q = q.gt('track_count', 0);
+  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json({ albums: data });
 });
@@ -391,13 +419,7 @@ router.get('/stories', requireAuth, async (req, res) => {
     .order('title');
   if (error) return res.status(500).json({ error: error.message });
 
-  const stories = data.map((s) => ({
-    id: s.id,
-    storyTitle: s.title,
-    narrator: s.narrator,
-    coverImageUrl: s.cover_image_url,
-    episodeCount: s.episode_count
-  }));
+  const stories = data.map(seriesJson);
   res.json({ stories });
 });
 
@@ -428,94 +450,44 @@ router.get('/stories/:id/episodes', requireAuth, async (req, res) => {
     episodeNumber: m.chapter_number,
     episodeTitle: m.episode_title || null,
     title: m.title, // composed "StoryTitle_N_Title" — kept for the legacy client
-    coverImageUrl: m.cover_image_url,
+    coverImageUrl: series.cover_image_url || m.cover_image_url || null, // ONE image per series
     durationSeconds: m.duration_seconds,
     fileSizeBytes: m.file_size_bytes,
     category: m.category
   }));
 
-  res.json({
-    series: {
-      id: series.id,
-      storyTitle: series.title,
-      narrator: series.narrator,
-      coverImageUrl: series.cover_image_url,
-      episodeCount: series.episode_count
-    },
-    episodes
-  });
+  res.json({ series: seriesJson(series), episodes });
 });
 
 // Admin: manually set/replace a story series' cover image, without
 // needing to upload a whole new episode to trigger the cover-replace
-// path in findOrCreateStorySeries above. Needed because a series' Drime
+// path in the artwork service (lib/artwork.js) above. Needed because a series' Drime
 // cover file can go missing on its own (deleted by hand directly on
 // Drime, as opposed to being replaced through this app) — this lets the
 // admin re-upload just the image and point the series at it.
 // Body: { coverImageUrl, coverStorageAccountId, coverStorageFileId,
 // coverStorageHash } — get these from POST /api/storage/upload-image
 // first (same upload-then-register two-step every other cover already
-// uses; see lib/coverImageStorage.js).
+// uses; see lib/coverImageStorage.js). New admin builds use PUT /stories/:id/artwork
+// instead, which uploads and attaches in one atomic, de-duplicated step.
 router.patch('/stories/:id/cover', requireAuth, requireAdmin, async (req, res) => {
   const { coverImageUrl, coverStorageAccountId, coverStorageFileId, coverStorageHash } = req.body;
   if (!coverImageUrl) {
-    return res.status(400).json({ error: 'coverImageUrl is required — upload the image via POST /api/storage/upload-image first' });
+    return res.status(400).json({ error: 'coverImageUrl is required — upload the image via PUT /stories/:id/artwork instead (or POST /api/storage/upload-image first)' });
   }
-
-  const { data: series, error: seriesErr } = await supabase
-    .from('story_series').select('*').eq('id', req.params.id).maybeSingle();
-  if (seriesErr) return res.status(500).json({ error: seriesErr.message });
-  if (!series) return res.status(404).json({ error: 'Story series not found' });
-
-  const oldAccountId = series.image_storage_account_id;
-  const oldStorageFileId = series.image_storage_file_id;
-
-  const { data: updated, error: updErr } = await supabase
-    .from('story_series')
-    .update({
-      cover_image_url: coverImageUrl,
-      image_storage_account_id: coverStorageAccountId || null,
-      image_storage_file_id: coverStorageFileId || null,
-      image_storage_hash: coverStorageHash || null
-    })
-    .eq('id', req.params.id)
-    .select()
-    .single();
-  if (updErr) return res.status(500).json({ error: updErr.message });
-
-  // Propagate to every existing episode of this series, same as the
-  // upload-time cover-replace path in findOrCreateStorySeries above —
-  // a manual re-cover should take effect everywhere immediately, not
-  // just for episodes uploaded from now on.
-  const { data: propagated, error: propErr } = await supabase
-    .from('media_items')
-    .update({ cover_image_url: coverImageUrl })
-    .eq('story_series_id', req.params.id)
-    .select('id');
-  if (propErr) console.error('[stories/:id/cover] episode propagation failed (continuing):', propErr.message);
-  else if (propagated) propagated.forEach((row) => mediaItemCache.invalidate(row.id));
-
-  // Best-effort cleanup of whatever file this cover used to point at.
-  // Both an old row predating these columns (oldStorageFileId null) and
-  // the exact scenario this endpoint exists for (the old Drime file was
-  // already deleted by hand, so this delete just 404s upstream) are
-  // expected, non-fatal outcomes here — the new cover is already live
-  // and correct on the row above either way.
-  if (oldAccountId && oldStorageFileId) {
-    coverImageStorage
-      .deleteImage({ accountId: oldAccountId, storageFileId: oldStorageFileId })
-      .catch((e) => console.error('[stories/:id/cover] failed to delete old cover (continuing):', e.response?.data?.message || e.message));
+  try {
+    const series = await artwork.getSeries(req.params.id);
+    if (!series) return res.status(404).json({ error: 'Story series not found' });
+    // Repoints the series at the uploaded file, mirrors it onto every episode and
+    // deletes the previous file only if nothing references it any more.
+    const updated = await artwork.setSeriesArtworkFromUploaded({
+      seriesId: req.params.id, url: coverImageUrl,
+      accountId: coverStorageAccountId, storageFileId: coverStorageFileId, storageHash: coverStorageHash
+    });
+    res.json({ series: seriesJson(updated || series) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  res.json({
-    series: {
-      id: updated.id,
-      storyTitle: updated.title,
-      narrator: updated.narrator,
-      coverImageUrl: updated.cover_image_url,
-      episodeCount: updated.episode_count
-    }
-  });
 });
 
 // Same "is this episode still worth resuming" threshold AppState uses on
@@ -603,7 +575,8 @@ router.get('/continue-listening', requireAuth, async (req, res) => {
     .in('id', progressRows.map((r) => r.media_item_id))
     .eq('type', 'audio_story');
   if (itemsErr) return res.status(500).json({ error: itemsErr.message });
-  const itemById = new Map(items.map((m) => [m.id, m]));
+  const resolvedItems = await artwork.applyArtwork(items);
+  const itemById = new Map(resolvedItems.map((m) => [m.id, m]));
 
   const bySeriesKey = new Map();
   for (const row of progressRows) {
@@ -685,6 +658,14 @@ router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
   const { error } = await supabase.from('media_items').delete().eq('id', req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   mediaItemCache.invalidate(req.params.id); // don't let a deleted item keep resolving from cache — see lib/mediaItemCache.js
+
+  // Counters used to only ever go up. Recompute from the rows so they stay true.
+  try {
+    if (item?.album_id) await artwork.recountAlbum(item.album_id);
+    if (item?.story_series_id) await artwork.recountSeries(item.story_series_id);
+  } catch (e) {
+    console.error('[media delete] count refresh failed (continuing):', e.message);
+  }
 
   // Best-effort: evict this item's edge-cached audio bytes so it stops
   // being servable from a warm Cloudflare cache immediately, rather than

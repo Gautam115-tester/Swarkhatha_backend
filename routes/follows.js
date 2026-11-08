@@ -1,6 +1,7 @@
 const express = require('express');
 const supabase = require('../lib/supabaseClient');
 const { requireAuth } = require('../middleware/auth');
+const artwork = require('../lib/artwork').getDefault();
 
 const router = express.Router();
 
@@ -13,6 +14,12 @@ router.get('/', requireAuth, async (req, res) => {
     .eq('user_id', req.user.sub)
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
+  // A follow stores a snapshot of the cover from the day it was created. Resolve
+  // the series' CURRENT (single) artwork so Following never shows a stale image.
+  try {
+    const covers = await artwork.artworkForSeriesKey(data.map((f) => f.series_key));
+    data.forEach((f, i) => { if (covers[i]) f.cover_image_url = covers[i]; });
+  } catch (_) { /* keep the stored snapshot if the lookup fails */ }
   res.json({ follows: data });
 });
 

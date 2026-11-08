@@ -8,6 +8,7 @@ const drime = require('../lib/drime');
 const liveMonitor = require('../lib/liveAccountsMonitor');
 const coverImageStorage = require('../lib/coverImageStorage');
 const coverImageCache = require('../lib/coverImageCache');
+const { coverBaseUrl: sharedCoverBaseUrl } = require('../lib/coverUrl');
 const accountCache = require('../lib/accountCache');
 const mediaItemCache = require('../lib/mediaItemCache');
 const { mediaLimiter } = require('../middleware/rateLimit');
@@ -62,7 +63,7 @@ function baseUrl(req) {
 // it's left unset. scripts/repoint-cover-urls-to-cdn.js updates
 // already-uploaded covers to match once this is configured.
 function coverBaseUrl(req) {
-  return process.env.IMAGE_CDN_BASE_URL || baseUrl(req);
+  return sharedCoverBaseUrl(req); // same rule as lib/coverUrl.js, which media.js also uses
 }
 
 // Audio is the bandwidth-heavy counterpart to cover images above — every
@@ -485,7 +486,8 @@ router.post('/upload-image', requireAuth, requireAdmin, uploadImage.single('imag
       accountId: uploaded.accountId,
       storageFileId: uploaded.storageFileId,
       storageHash: uploaded.storageHash,
-      sizeBytes: uploaded.sizeBytes
+      sizeBytes: uploaded.sizeBytes,
+      reused: Boolean(uploaded.reused) // true = identical image was already stored; nothing new was written to Drime
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
