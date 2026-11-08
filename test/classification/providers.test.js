@@ -197,7 +197,8 @@ test('LLM: maps only vocabulary names, caps confidence, ignores unknown songs, r
   const r = await createLlm().lookup(track('Shayad', 'Arijit Singh'), ctx);
   assert.deepEqual(keys(r), ['genre:bollywood', 'language:hindi', 'mood:romantic', 'vocal:male-vocal']);
   assert.ok(r.observations.every((o) => o.p <= 0.6));
-  assert.deepEqual(Object.keys(seen).sort(), ['album', 'artist', 'title', 'vocab', 'year'], 'only text metadata is sent');
+  // genreTree is the static taxonomy hierarchy (the same for every track), not track data.
+  assert.deepEqual(Object.keys(seen).sort(), ['album', 'artist', 'genreTree', 'title', 'vocab', 'year'], 'only text metadata is sent');
   assert.ok(!('audio' in seen));
 
   const v = await createLlm().lookup(track('Shayad (Reprise)', 'Arijit Singh'), ctxFor(null, {}, { llmClassify: async () => ({ knownSong: true, picks }) }));

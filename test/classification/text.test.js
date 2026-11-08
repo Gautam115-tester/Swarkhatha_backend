@@ -81,3 +81,9 @@ test('similarity', () => {
   assert.ok(t.similarity('Shayad', 'Shayari') < 0.82);
   assert.equal(t.similarity('', 'x'), 0);
 });
+
+
+test('a soundtrack album marks the track as film music even without a title marker', () => {
+  assert.equal(t.parseTitle('Dhak Dhak', { album: 'Love Aaj Kal (Original Motion Picture Soundtrack)' }).film, '(soundtrack)');
+  assert.equal(t.parseTitle('Dhak Dhak', { album: 'Some Studio Album' }).film, null);
+});

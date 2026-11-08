@@ -275,3 +275,30 @@ test('metadata row stores provider ids, status and engine version; sources keep 
   assert.equal(m.classification_version, cfg.version); assert.ok(m.last_classified_at); assert.equal(m.original_title, 'Shayad');
   assert.equal(db.music_classification_sources[0].external_id, 'mbid-9');
 });
+
+
+test('a weakly-guessed specific genre does not displace a better-supported broader genre', async () => {
+  const { svc, db } = await seededService({ providers: [
+    provider('llm', [obs('genre:bollywood-romantic', 'llm', 0.57, 'composition')])
+  ] });
+  // soundtrack album -> film-music evidence from title_parse, independent of the LLM
+  const t = addTrack(db, { title: 'Dhak Dhak', artist_or_narrator: 'Pritam', album_or_series: 'Love Aaj Kal (Original Motion Picture Soundtrack)' });
+  await svc.engine.classifyTrack(t.id);
+  const L = labelsOf(db, t.id);
+  assert.ok(L['genre:film-music'], 'broader, corroborated genre is kept');
+  assert.notEqual(L['genre:film-music'].status, 'needs_review');
+  assert.equal(L['genre:bollywood-romantic'], undefined, 'the single-source specific guess is not stored over it');
+});
+
+test('a specific genre that is itself well supported still wins over its ancestors', async () => {
+  const { svc, db } = await seededService({ providers: [
+    provider('musicbrainz', [obs('genre:bollywood-romantic', 'musicbrainz', 0.8, 'composition')]),
+    provider('lastfm', [obs('genre:bollywood-romantic', 'lastfm', 0.6, 'composition')])
+  ] });
+  const t = addTrack(db, { title: 'Tum Hi Ho', artist_or_narrator: 'Arijit Singh' });
+  await svc.engine.classifyTrack(t.id);
+  const L = labelsOf(db, t.id);
+  assert.ok(L['genre:bollywood-romantic']);
+  assert.equal(L['genre:bollywood'], undefined);
+  assert.equal(L['genre:film-music'], undefined);
+});
