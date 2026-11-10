@@ -27,6 +27,12 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
     return res.status(400).json({ error: "appliesTo must be 'music', 'audio_story', or 'both'" });
   }
 
+  // Music is labelled automatically (lib/classification) from a fixed vocabulary; admins change a
+  // track's label, they do not invent new music categories.
+  if (appliesTo === 'music' || appliesTo === 'both') {
+    return res.status(403).json({ error: 'Music labels are assigned automatically and cannot be created by hand. Change a track\'s label from Music Labels instead.' });
+  }
+
   const { data, error } = await supabase.from('content_labels')
     .insert({ name, applies_to: appliesTo, sort_order: sortOrder })
     .select().single();

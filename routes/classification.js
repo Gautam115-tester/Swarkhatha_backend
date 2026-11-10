@@ -8,6 +8,8 @@
  *   GET    /tracks/:id                   full classification detail + evidence
  *   GET    /tracks/:id/labels            approved labels only (any logged-in user)
  *   POST   /tracks/:id/labels            { labelId|key, action: add|remove|approve|reject, note? }  manual override
+ *   POST   /tracks/:id/labels/change     { fromLabelId, toLabelId, note? }  change a label to another of the same kind
+ *   GET    /library[?attention=1&labelId=&limit=&offset=]  music + labels for the admin screen
  *   POST   /tracks/:id/reclassify
  *   POST   /reclassify                   { ids: [...] } | { all: true }
  *   POST   /backfill                     { batchSize?, dryRun?, minVersion?, requiredDimensions?, limit? }
@@ -67,6 +69,20 @@ function createRouter({ getService, supabase }) {
     if (!['add', 'remove', 'approve', 'reject'].includes(action)) throw bad('action must be add, remove, approve or reject');
     if (labelId && !UUID.test(String(labelId))) throw bad('invalid labelId');
     res.json(await svc().manualLabel(needId(req.params.id), { labelId, key, action, note: note ? String(note).slice(0, 500) : null, actor: req.user.sub }));
+  }));
+
+  // The admin's one real edit: change a label to another label of the same kind (fixed vocabulary, nothing is created).
+  router.post('/tracks/:id/labels/change', wrap(async (req, res) => {
+    const { fromLabelId, toLabelId, note } = req.body || {};
+    if (!UUID.test(String(fromLabelId)) || !UUID.test(String(toLabelId))) throw bad('fromLabelId and toLabelId are required');
+    res.json(await svc().changeLabel(needId(req.params.id), { fromLabelId, toLabelId, note: note ? String(note).slice(0, 500) : null, actor: req.user.sub }));
+  }));
+
+  // Music with its labels (titles only, no covers/audio). ?attention=1 = only tracks with labels waiting for review.
+  router.get('/library', wrap(async (req, res) => {
+    const { labelId } = req.query;
+    if (labelId && !UUID.test(String(labelId))) throw bad('invalid labelId');
+    res.json(await svc().library({ limit: intIn(req.query.limit, 30, 100), offset: Math.max(0, Number(req.query.offset) || 0), attention: /^(1|true)$/i.test(String(req.query.attention || '')), labelId: labelId || null }));
   }));
 
   router.post('/tracks/:id/reclassify', wrap(async (req, res) => {

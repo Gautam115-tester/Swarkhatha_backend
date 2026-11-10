@@ -113,7 +113,28 @@ or was never attempted for a required dimension. Non-music content is excluded.
 | `GET /jobs[?status=]`, `POST /jobs/retry-failed`, `POST /seed` | |
 | `POST /cron/run` | shared-secret header; hidden (404) unless `CLASSIFICATION_CRON_SECRET` is set |
 
-There is **no Flutter admin screen** yet; use these endpoints or the CLI. (The admin app was not modified.)
+The admin app has a **More › Music Labels** screen on top of these endpoints (progress, "Needs review" list, all music,
+per-track label editor). The CLI still works too.
+
+### Admin editing: change only, nothing is created
+
+| | |
+|---|---|
+| `POST /tracks/:id/labels/change` | `{fromLabelId, toLabelId, note?}`: swap a label for another of the **same kind** (genre→genre, language→language…). Both must exist in the fixed vocabulary; anything else is a 400/404. Both rows become manual, so the engine never reverts them. A new **genre** also moves the legacy `category` / `content_label_id` the listener app browses by, but only if that genre maps to an active music content label (the automatic engine itself still only fills an *empty* legacy label). |
+| `GET /library[?attention=1&labelId=&limit=&offset=]` | music with its labels (titles only: no covers, no audio). `attention=1` = only tracks with labels waiting for review |
+| `POST /api/labels` with `appliesTo: music \| both` | now **403**: music labels are automatic. Audio-story labels are unchanged |
+
+Uploading music no longer asks for a label; the upload screens say so. The older Groq "backfill missing categories" button
+now only covers audio stories while classification is on (otherwise it would fill music's legacy category first, with weaker
+evidence, and the engine's "only fill an empty one" rule would then skip it).
+
+### No Render bandwidth
+
+Labelling only moves small JSON between the backend and MusicBrainz / Last.fm / Spotify / Groq (title, artist, album, year).
+No audio is read, downloaded or streamed by the backend for it. The optional audio analyzer stays **off**; if you ever turn it on,
+its link now points at `AUDIO_CDN_BASE_URL` (the Cloudflare worker, which streams straight from Drime) and is **refused** when that
+variable is not set, so audio can never be pulled through Render by accident. The admin app polls `/status` every 8 s only while
+labelling is actually running.
 
 ## Guarantees and how they are enforced
 
